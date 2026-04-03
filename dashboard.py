@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 
 """
-Author: Ziyi Zhang, Yanbing Wang
 Traffic Simulation Dashboard
 
 This script creates an interactive web dashboard to visualize and analyze traffic simulation 
 data from SUMO. It provides:
 - Real-time visualization of traffic metrics
-- Multiple analysis tabs (Safety, Throughput & Stability, Interaction with Other Drivers, Fuel Consumption, Time-Space)
+- Multiple analysis tabs (Safety, Mobility, Behavioral, Time-Space)
 - Interactive plots and filters
 - Statistics and performance metrics
 - Support for comparing CAV and HDV behaviors
@@ -32,16 +31,64 @@ Requirements:
     - pandas
     - numpy
     - dash-bootstrap-components
+"""
 
+'''
+ZY [10/17/2025]
+1) Publication‑style visuals
+   - Added `paper_pub` Plotly template (clean grid, serif font, tight margins).
+   - Unified color map for HDV/CAV and urban metrics.
+   - `_apply_paper_style()` standardizes axis labels/units/grid/legend across plots.
+
+2) Urban signals integration (toggle with `--urban`)
+   - Optional “Urban Signals” tab: Throughput, Avg Delay, Queue Length, v/c Ratio, Approach Delay, and spillback charts.
+   - Modes: `auto` (show when detector+TLS exist), `yes` (force show), `no` (hide).
+
+3) Time–Space analysis (viewer + exporter)
+   - Time–Space tab added (Plotly hook to `vis.visualize_fcd()`; placeholder enabled by default).
+   - CSV exporter `export_time_space_csv(...)` with robust filters:
+     warm‑up trimming, position gate, queue‑clearing (CLEAR_V/CLEAR_M), jump detection, stride, optional speed, gzip.
+
+4) Data loading & caching
+   - Uses `load_or_build_metrics()` to reuse cached metrics when inputs are unchanged (signature = mtime+size).
+   - Wired into the dashboard entrypoint to avoid rebuilding metrics on every run.
+
+5) Result export for reproducible figures (CSV/XLSX/JSON)
+   - `export_dashboard_datasets()` writes compact, plot‑ready tables to XLSX (multi‑sheet).
+   - `export_spillback()` saves spillback events to CSV/JSON and prints a console summary.
+   - Added time‑series and histogram bin exports so figures can be regenerated offline.
+
+6) Guardrails & thresholds (UI aligned with analysis defaults)
+   - Harmonized small‑value cutoffs for TTC/PET/Headway/Space‑gap and light clipping
+     for more stable, publication‑friendly plots.
+   - Consistent palette ordering (HDV blue, CAV red) across all tabs.
+
+Note: This commit only refines comments/docstrings/labels/printouts. No functional changes.
+'''
+
+'''
+Visualize traffic metrics in an interactive web dashboard.
+
+graph TD
+    A[SUMO FCD XML] --> B[TrafficMetrics Class]
+    B --> C[Preprocessed Data]
+    C --> D[Dash Web App]
+    D --> E[Interactive Components]
+    D --> F[Plots/Visualizations]
+    D --> G[Stats/Metrics]
+
+'''
+"""
 Usage examples:
-    # On-ramp scenario, ACC controller, 10% CAV penetration, excluding ramp lanes
-    python dashboard.py --scenario onramp --urban no --exclude-lane ramp_0 --exclude-lane E2_0 --cav-controller acc --p 0.1
+    omramp:
+    python dashboard.py --scenario onramp --urban no --exclude-lane ramp_0 --exclude-lane E2_0 --p 0.1
 
-    # On-ramp scenario, ACC controller, 50% CAV penetration
-    python dashboard.py --scenario onramp --p 0.5 --cav-controller acc
+    i24
+    python dashboard.py --scenario i24 --urban no --exclude-lane E2_0 --exclude-lane E4_0 --exclude-lane E6_0  --exclude-lane E1_0 --p 0.1
 
-    # I-24 scenario, excluding on-ramp/off-ramp connector lanes
-    python dashboard.py --scenario i24 --urban no --exclude-lane E2_0 --exclude-lane E4_0 --exclude-lane E6_0 --exclude-lane E1_0 --p 0.1
+    python dashboard.py \
+    --scenario i24b --urban no \
+    $(printf -- '--exclude-lane %q ' "${ALL_EXCLUDES[@]}")
 """
 
 import dash
@@ -79,13 +126,13 @@ def _safe_histogram(df, x, color=None, nbins=50, barmode='overlay',
     )
     return fig
 
-# Unified, high-contrast palette: HDV blue, CAV red, PAOG amber, GOR purple, TTS green
+# Unified, high-contrast palette
 COLOR_MAP = {
     "HDV": "#1f77b4",
     "CAV": "#d62728",
-    "PAOG": "#ff7f0e",
-    "GOR": "#9467bd",
-    "TTS": "#2ca02c",
+    "Throughput": "#ff7f0e",
+    "QueueLength": "#9467bd",
+    "VC": "#2ca02c",
 }
 
 paper_pub = go.layout.Template(
@@ -149,9 +196,11 @@ def export_spillback(metrics, out_dir):
             return
 
         df = pd.DataFrame(events)
-        f = f"{args.scenario}_cav{int(100 * (metrics.num_cavs / max(1, metrics.num_cavs + metrics.num_hdvs)))}"
+        pen_tag = getattr(metrics, "penetration_tag", None) or "p0"
+        seed_suffix = f"_seed{int(args.seed)}" if getattr(args, "seed", None) is not None else ""
+        f = f"{args.scenario}_{pen_tag}{seed_suffix}_cav{int(100 * (metrics.num_cavs / max(1, metrics.num_cavs + metrics.num_hdvs)))}"
         csv_path = os.path.join(out_dir, f"{f}_spillback_events.csv")
-        json_path = os.path.join(out_dir, f"{f}_spillback_events_1h_p0.3.json")
+        json_path = os.path.join(out_dir, f"{f}_spillback_events_1h_{pen_tag}.json")
         df.to_csv(csv_path, index=False)
         df.to_json(json_path, orient="records", indent=2)
 
@@ -255,7 +304,16 @@ def export_dashboard_datasets(metrics, out_dir: str, run_label: str = "run"):
         ])
         drac_df.to_excel(xw, sheet_name="safety_DRAC_summary", index=False)
 
-        # ===================== Throughput & Stability =====================
+        # Headway histogram
+        hw_hdv = [v for v in metrics.time_headways.get("hdv", []) if np.isfinite(v) and v >= EPS_HW]
+        hw_cav = [v for v in metrics.time_headways.get("cav", []) if np.isfinite(v) and v >= EPS_HW]
+        hw_max = max([np.percentile(hw_hdv, 99, method="nearest") if hw_hdv else 0,
+                      np.percentile(hw_cav, 99, method="nearest") if hw_cav else 0, 1.0])
+        hw_bins = np.linspace(0, hw_max, 50)
+        hw_hist = _hist_2type(hw_hdv, hw_cav, hw_bins)
+        hw_hist.to_excel(xw, sheet_name="safety_Headway_hist", index=False)
+
+        # ===================== Mobility =====================
         # Speed histogram
         sv = getattr(metrics, "speeds_vis", metrics.speeds)
         sp_hdv = [v for v in sv.get("hdv", []) if np.isfinite(v)]
@@ -315,7 +373,7 @@ def export_dashboard_datasets(metrics, out_dir: str, run_label: str = "run"):
         })
         delay_df.to_excel(xw, sheet_name="mobility_Delay_compare", index=False)
 
-        # ===================== Interaction with Other Drivers =====================
+        # ===================== Behavioral =====================
         # Lane-change frequency (discrete counts)
         lc = pd.DataFrame({
             "Lane Changes": (metrics.lane_change_frequency.get("hdv", []) + metrics.lane_change_frequency.get("cav", [])),
@@ -324,8 +382,7 @@ def export_dashboard_datasets(metrics, out_dir: str, run_label: str = "run"):
         })
         # Discrete histogram via value_counts
         lc_h = (lc[lc["Type"]=="HDV"]["Lane Changes"].value_counts().sort_index()).rename("HDV")
-        # Handle both 'CAV' and 'cav_*' variants
-        lc_c = (lc[lc["Type"].str.upper().str.startswith("CAV")]["Lane Changes"].value_counts().sort_index()).rename("CAV")
+        lc_c = (lc[lc["Type"]=="CAV"]["Lane Changes"].value_counts().sort_index()).rename("CAV")
         lc_hist = pd.concat([lc_h, lc_c], axis=1).fillna(0).astype(int).reset_index().rename(columns={"index":"k"})
         lc_hist.to_excel(xw, sheet_name="behav_LC_hist", index=False)
 
@@ -357,16 +414,7 @@ def export_dashboard_datasets(metrics, out_dir: str, run_label: str = "run"):
         # Export histogram counts (sufficient for publication figures)
         sg_hist.to_excel(xw, sheet_name="behav_SpaceGap_hist", index=False)
 
-        # Time headway histogram
-        hw_hdv = [v for v in metrics.time_headways.get("hdv", []) if np.isfinite(v) and v >= EPS_HW]
-        hw_cav = [v for v in metrics.time_headways.get("cav", []) if np.isfinite(v) and v >= EPS_HW]
-        hw_max = max([np.percentile(hw_hdv, 99, method="nearest") if hw_hdv else 0,
-                      np.percentile(hw_cav, 99, method="nearest") if hw_cav else 0, 1.0])
-        hw_bins = np.linspace(0, hw_max, 50)
-        hw_hist = _hist_2type(hw_hdv, hw_cav, hw_bins)
-        hw_hist.to_excel(xw, sheet_name="interaction_Headway_hist", index=False)
-
-        # ===================== Fuel Consumption =====================
+        # ===== Energy & Fuel (from analysis) =====
         fuel_stats = metrics.simulation_stats.get('fuel', {})
         fuel_df = pd.DataFrame({
             "Vehicle Type": ["HDV", "CAV"],
@@ -392,52 +440,72 @@ def export_dashboard_datasets(metrics, out_dir: str, run_label: str = "run"):
         fuel_df_extra.to_excel(xw, sheet_name="energy_fuel_summary2", index=False)
 
         # ===================== Urban Signals (if available) =====================
-        # PAOG (time-averaged line)
-        if hasattr(metrics, "paog_by_detector") and isinstance(metrics.paog_by_detector, dict) and any(metrics.paog_by_detector.values()):
-            rows = []
-            for lane, recs in metrics.paog_by_detector.items():
-                for r in recs:
-                    if r.get("paog") is None: 
-                        continue
-                    t_mid = (r["begin"] + r["end"]) / 2.0
-                    rows.append({"Time": t_mid, "PAOG": float(r["paog"])})
-            paog_df = pd.DataFrame(rows)
-            if not paog_df.empty:
-                paog_avg = paog_df.groupby("Time", as_index=False)["PAOG"].mean().sort_values("Time")
-                paog_avg.to_excel(xw, sheet_name="urban_PAOG_avg_ts", index=False)
+        # Throughput (summary + timeseries)
+        if hasattr(metrics, "throughput_values") and isinstance(metrics.throughput_values, dict):
+            tp = metrics.throughput_values
+            tp_df = pd.DataFrame({
+                "Metric": ["Total Vehicles", "Vehicles/hr", "CAV Vehicles", "HDV Vehicles",
+                           "CAV Vehicles/hr", "HDV Vehicles/hr"],
+                "Value": [tp.get("total_vehicles", 0), tp.get("vehicles_per_hour", 0),
+                          tp.get("cav_vehicles", 0), tp.get("hdv_vehicles", 0),
+                          tp.get("cav_vehicles_per_hour", 0), tp.get("hdv_vehicles_per_hour", 0)],
+            })
+            tp_df.to_excel(xw, sheet_name="urban_Throughput", index=False)
+            ts_rows = tp.get("timeseries", [])
+            if ts_rows:
+                pd.DataFrame(ts_rows).to_excel(xw, sheet_name="urban_Throughput_ts", index=False)
+            tp_summary = tp.get("summary", {})
+            if tp_summary:
+                pd.DataFrame(list(tp_summary.values())).to_excel(
+                    xw, sheet_name="urban_Throughput_int", index=False)
 
-        # GOR by type
-        if hasattr(metrics, "gor_type") and isinstance(metrics.gor_type, dict):
-            g_rows = []
-            if metrics.gor_type.get("hdv") is not None:
-                g_rows.append({"Vehicle Type":"HDV", "GOR": float(metrics.gor_type["hdv"])})
-            if metrics.gor_type.get("cav") is not None:
-                g_rows.append({"Vehicle Type":"CAV", "GOR": float(metrics.gor_type["cav"])})
-            if g_rows:
-                pd.DataFrame(g_rows).to_excel(xw, sheet_name="urban_GOR_byType", index=False)
+        # Average Delay (summary + timeseries)
+        if hasattr(metrics, "average_delay_values") and isinstance(metrics.average_delay_values, dict):
+            ad = metrics.average_delay_values
+            ad_df = pd.DataFrame({
+                "Vehicle Type": ["ALL", "HDV", "CAV"],
+                "Avg Delay (s)": [ad.get("avg_delay_all", 0), ad.get("avg_delay_hdv", 0),
+                                  ad.get("avg_delay_cav", 0)],
+                "Avg Stopped Delay (s)": [ad.get("avg_stopped_delay_all", 0),
+                                          ad.get("avg_stopped_delay_hdv", 0),
+                                          ad.get("avg_stopped_delay_cav", 0)],
+                "Sample Count": [ad.get("n_all", 0), ad.get("n_hdv", 0), ad.get("n_cav", 0)],
+            })
+            ad_df.to_excel(xw, sheet_name="urban_AvgDelay", index=False)
+            ad_ts = ad.get("timeseries", [])
+            if ad_ts:
+                pd.DataFrame(ad_ts).to_excel(xw, sheet_name="urban_AvgDelay_ts", index=False)
 
-        # Approach delay by type
-        if hasattr(metrics, "approach_delay_values") and isinstance(metrics.approach_delay_values, dict):
-            ad = metrics.approach_delay_values
-            ad_df = pd.DataFrame({"Vehicle Type":["HDV","CAV"],
-                                  "Approach Delay (s)":[float(ad.get("hdv",0) or 0), float(ad.get("cav",0) or 0)]})
-            ad_df.to_excel(xw, sheet_name="urban_ApproachDelay", index=False)
+        # Queue Count (summary + timeseries)
+        if hasattr(metrics, "queue_length_values") and isinstance(metrics.queue_length_values, dict):
+            ql = metrics.queue_length_values
+            ql_rows = ql.get("summary_rows", [])
+            if ql_rows:
+                pd.DataFrame(ql_rows).to_excel(xw, sheet_name="urban_QueueLength", index=False)
+            else:
+                ql_df = pd.DataFrame({
+                    "Metric": ["Avg Queued Vehicles", "Max Queued Vehicles",
+                               "Avg Queued CAV", "Avg Queued HDV"],
+                    "Value": [ql.get("avg_queue_vehicles", 0), ql.get("max_queue_vehicles", 0),
+                              ql.get("avg_queue_cav", 0), ql.get("avg_queue_hdv", 0)],
+                })
+                ql_df.to_excel(xw, sheet_name="urban_QueueLength", index=False)
+            ql_cycles = ql.get("cycle_records", [])
+            if ql_cycles:
+                pd.DataFrame(ql_cycles).to_excel(xw, sheet_name="urban_QueueLength_cycles", index=False)
 
-        # TTS by type / legacy structure
-        if hasattr(metrics, "time_to_service_split") and isinstance(metrics.time_to_service_split, dict):
-            ts = metrics.time_to_service_split
-            tts_rows = []
-            if ts.get("hdv",{}).get("avg") is not None:
-                tts_rows.append({"Vehicle Type":"HDV","Avg TTS (s)": float(ts["hdv"]["avg"])})
-            if ts.get("cav",{}).get("avg") is not None:
-                tts_rows.append({"Vehicle Type":"CAV","Avg TTS (s)": float(ts["cav"]["avg"])})
-            if tts_rows:
-                pd.DataFrame(tts_rows).to_excel(xw, sheet_name="urban_TTS_byType", index=False)
-        elif hasattr(metrics,"time_to_service_values") and isinstance(metrics.time_to_service_values, dict):
-            tv = metrics.time_to_service_values
-            pd.DataFrame({"Statistic":["Average","Max"],
-                          "Time to Service (s)":[float(tv.get("avg",0) or 0), float(tv.get("max",0) or 0)]}
-                        ).to_excel(xw, sheet_name="urban_TTS_legacy", index=False)
+        # v/c Ratio (summary + timeseries)
+        if hasattr(metrics, "vc_ratio_values") and isinstance(metrics.vc_ratio_values, dict):
+            vc = metrics.vc_ratio_values
+            vc_df = pd.DataFrame({
+                "Metric": ["Avg v/c", "Max v/c (critical)", "Total Volume (vph)", "Total Capacity (vph)"],
+                "Value": [vc.get("vc_ratio_avg", 0), vc.get("vc_ratio_max", 0),
+                          vc.get("volume_vph", 0), vc.get("capacity_vph", 0)],
+            })
+            vc_df.to_excel(xw, sheet_name="urban_VC_Ratio", index=False)
+            vc_ts = vc.get("timeseries", [])
+            if vc_ts:
+                pd.DataFrame(vc_ts).to_excel(xw, sheet_name="urban_VC_Ratio_ts", index=False)
 
     print(f"[EXPORT] Plot-ready datasets saved to: {xlsx_path}")
 
@@ -445,14 +513,11 @@ def create_dashboard(metrics, direction=None, urban_mode='auto'):
     '''
     If `direction` is None, plot all vehicle headings from the FCD; otherwise filter.
     '''
-    print("Starting dashboard creation...")
-    
     app = dash.Dash(
         __name__,
         external_stylesheets=[dbc.themes.BOOTSTRAP],
         suppress_callback_exceptions=True,
     )
-    print("Dash app initialized")
     
     # Basic CSS for stat cards
     app.index_string = '''
@@ -506,9 +571,7 @@ def create_dashboard(metrics, direction=None, urban_mode='auto'):
     # Calculate CAV penetration rate
     try:
         cav_rate = metrics.num_cavs / (metrics.num_cavs + metrics.num_hdvs)
-        print(f"CAV penetration rate calculated: {cav_rate*100:.1f}%")
     except Exception as e:
-        print(f"Error calculating CAV rate: {e}")
         cav_rate = 0
 
     # Simple card builder
@@ -569,32 +632,74 @@ def create_dashboard(metrics, direction=None, urban_mode='auto'):
         ('CAV Avg Fuel', f"{fuel_stats.get('cav_avg_fuel_per_vehicle_g', 0):.2f} g")
     ]
     
+    def _urban_intersection_ids():
+        """Collect all intersection IDs across urban metrics."""
+        ids = set()
+        for attr in ("throughput_values", "average_delay_values", "queue_length_values",
+                      "vc_ratio_values"):
+            vals = getattr(metrics, attr, None)
+            if isinstance(vals, dict):
+                for row in vals.get("timeseries", []):
+                    iid = row.get("intersection_id")
+                    if iid and iid != "unknown":
+                        ids.add(iid)
+                for row in vals.get("summary_rows", []):
+                    iid = row.get("intersection_id")
+                    if iid and iid != "unknown":
+                        ids.add(iid)
+                summary = vals.get("summary", {})
+                if isinstance(summary, dict):
+                    for iid in summary.keys():
+                        if iid and iid != "unknown":
+                            ids.add(iid)
+        return sorted(ids) or ["all"]
+
     def urban_signals_tab():
+        int_ids = _urban_intersection_ids()
         return dcc.Tab(label='Urban Signals', children=[
+            # Intersection selector
             dbc.Row([
-                dbc.Col(dcc.Graph(id='paog-plot'), md=7),
-                dbc.Col(dcc.Graph(id='gor-plot'), md=5),
+                dbc.Col([
+                    html.Label("Intersection:", style={"fontWeight": 600, "marginRight": "8px"}),
+                    dcc.Dropdown(
+                        id='urban-intersection-select',
+                        options=[{"label": i, "value": i} for i in int_ids],
+                        value=int_ids[0] if int_ids else None,
+                        clearable=False,
+                        style={"width": "300px", "display": "inline-block"},
+                    ),
+                ], md=6, style={"display": "flex", "alignItems": "center", "padding": "12px"}),
+            ]),
+            # Time-series line charts
+            dbc.Row([
+                dbc.Col(dcc.Graph(id='throughput-plot'), md=6),
+                dbc.Col(dcc.Graph(id='avg-delay-plot'), md=6),
             ]),
             dbc.Row([
-                dbc.Col(dcc.Graph(id='approach-delay-urban-plot'), md=6),
-                dbc.Col(dcc.Graph(id='tts-bar'), md=6),
+                dbc.Col(dcc.Graph(id='queue-length-plot'), md=6),
+                dbc.Col(dcc.Graph(id='vc-ratio-plot'), md=6),
             ]),
+            # Summary cards
+            dbc.Row([
+                dbc.Col(html.Div(id='urban-summary-cards'), md=12),
+            ], style={"marginTop": "16px"}),
         ])
       
     tabs_children = [
-        # Safety Tab
-        dcc.Tab(label='Safety', children=[
+        # Safety Metrics Tab
+        dcc.Tab(label='Safety Metrics', children=[
             dbc.Row([
                 dbc.Col(dcc.Graph(id='ttc-plot')), 
                 dbc.Col(dcc.Graph(id='pet-plot'))
             ]),
             dbc.Row([
-                dbc.Col(dcc.Graph(id='drac-plot'))
+                dbc.Col(dcc.Graph(id='drac-plot')),
+                dbc.Col(dcc.Graph(id='headway-plot'))
             ])
         ]),
         
-        # Throughput & Stability Tab
-        dcc.Tab(label='Throughput & Stability', children=[
+        # Mobility Metrics Tab
+        dcc.Tab(label='Mobility Metrics', children=[
             dcc.Interval(id='mobility-init', interval=10000, n_intervals=0),
             dbc.Row([
                 dbc.Col(dcc.Graph(id='speed-plot'), md=6),
@@ -609,15 +714,14 @@ def create_dashboard(metrics, direction=None, urban_mode='auto'):
             ])
         ]),
         
-        # Interaction with Other Drivers Tab
-        dcc.Tab(label='Interaction with Other Drivers', children=[
+        # Behavioral Metrics Tab
+        dcc.Tab(label='Behavioral Metrics', children=[
             dbc.Row([
                 dbc.Col(dcc.Graph(id='lane-change-plot')),
                 dbc.Col(dcc.Graph(id='gap-acceptance-plot'))
             ]),
             dbc.Row([
-                dbc.Col(dcc.Graph(id='space-gap-plot'), md=6),
-                dbc.Col(dcc.Graph(id='headway-plot'), md=6)
+                dbc.Col(dcc.Graph(id='space-gap-plot'), md=12)
             ])
         ]),
 
@@ -652,18 +756,12 @@ def create_dashboard(metrics, direction=None, urban_mode='auto'):
 
     # ------- Whether to show Urban Signals tab -------
     def has_urban_data():
-        has_paog = hasattr(metrics, 'paog_by_detector') and isinstance(metrics.paog_by_detector, dict) and any(metrics.paog_by_detector.values())
-        has_gor = (
-            (hasattr(metrics, 'gor_values') and isinstance(metrics.gor_values, dict) and (('all' in metrics.gor_values) or ('by_type' in metrics.gor_values)))
-            or (hasattr(metrics, 'gor_type') and isinstance(metrics.gor_type, dict) and any(k in metrics.gor_type for k in ('cav', 'hdv')))
-        )
+        has_throughput = hasattr(metrics, 'throughput_values') and isinstance(metrics.throughput_values, dict) and metrics.throughput_values.get('total_vehicles', 0) > 0
+        has_avg_delay = hasattr(metrics, 'average_delay_values') and isinstance(metrics.average_delay_values, dict) and metrics.average_delay_values.get('n_all', 0) > 0
+        has_queue = hasattr(metrics, 'queue_length_values') and isinstance(metrics.queue_length_values, dict)
+        has_vc = hasattr(metrics, 'vc_ratio_values') and isinstance(metrics.vc_ratio_values, dict)
         has_spill = hasattr(metrics, 'spillback_events') and isinstance(metrics.spillback_events, list) and len(metrics.spillback_events) > 0
-        has_tts = (
-            (hasattr(metrics, 'time_to_service_values') and isinstance(metrics.time_to_service_values, dict) and (('avg' in metrics.time_to_service_values) or ('by_type' in metrics.time_to_service_values)))
-            or (hasattr(metrics, 'time_to_service_split') and isinstance(metrics.time_to_service_split, dict) and any(k in metrics.time_to_service_split for k in ('all','cav','hdv')))
-        )
-        has_app_delay = hasattr(metrics, 'approach_delay_values') and isinstance(metrics.approach_delay_values, dict)
-        return has_paog or has_gor or has_spill or has_tts or has_app_delay
+        return has_throughput or has_avg_delay or has_queue or has_vc or has_spill
 
 
     show_urban_tab = False
@@ -893,7 +991,6 @@ def create_dashboard(metrics, direction=None, urban_mode='auto'):
         [Input('mobility-init', 'n_intervals')]
     )
     def update_mobility_metrics(_):
-        print("Updating mobility metrics...", flush=True)
         # --------- DataFrames ---------
         sv = getattr(metrics, "speeds_vis", metrics.speeds)
         av = getattr(metrics, "accel_vis",  metrics.accelerations)
@@ -981,7 +1078,7 @@ def create_dashboard(metrics, direction=None, urban_mode='auto'):
             number={"suffix": " s/mi"},
             delta={"reference": float(delay_stats.get('hdv_delay_per_mile', 0) or 0),
                    "increasing": {"color": COLOR_MAP["CAV"]},
-                   "decreasing": {"color": COLOR_MAP["TTS"]}},
+                   "decreasing": {"color": COLOR_MAP["VC"]}},
             title={"text": "CAV Delay per Mile vs HDV"},
             domain={'x': [0.0, 0.48], 'y': [0, 1]}
         ))
@@ -1024,7 +1121,6 @@ def create_dashboard(metrics, direction=None, urban_mode='auto'):
         [Input('lane-change-plot', 'relayoutData')]
     )
     def update_behavioral_metrics(_):
-        print("Updating behavioral metrics...")
         try:
             # === Data prep ===
             lc_data = pd.DataFrame({
@@ -1085,7 +1181,6 @@ def create_dashboard(metrics, direction=None, urban_mode='auto'):
             _apply_paper_style(gap_fig,       x_title="Gap",          x_unit="s", y_title="Count")
             _apply_paper_style(space_gap_fig, x_title="Space Gap",    x_unit="m", y_title="Count")
 
-            print("Behavioral metrics plots created successfully (beautified)")
             return lc_fig, gap_fig, space_gap_fig
 
         except Exception as e:
@@ -1099,7 +1194,6 @@ def create_dashboard(metrics, direction=None, urban_mode='auto'):
         [Input('time-space-plot', 'relayoutData')]
     )
     def update_time_space(_):
-        print("Updating time-space diagram...")
         """
         To use the actual FCD visualization, re-enable the call below:
         return vis.visualize_fcd(
@@ -1222,182 +1316,174 @@ def create_dashboard(metrics, direction=None, urban_mode='auto'):
             _apply_paper_style(empty_fig)
             return empty_fig, empty_fig, empty_fig
 
-    # Callback: Urban Signals (PAOG / GOR / Approach Delay / Spillback / TTS)
+    # Callback: Urban Signals — time-series line charts per intersection
     @app.callback(
-        [Output('paog-plot', 'figure'),
-         Output('gor-plot', 'figure'),
-         Output('approach-delay-urban-plot', 'figure'),
-         Output('tts-bar', 'figure')],
-        [Input('paog-plot', 'relayoutData')]
+        [Output('throughput-plot', 'figure'),
+         Output('avg-delay-plot', 'figure'),
+         Output('queue-length-plot', 'figure'),
+         Output('vc-ratio-plot', 'figure'),
+         Output('urban-summary-cards', 'children')],
+        [Input('urban-intersection-select', 'value')]
     )
-    def update_urban_signals(_):
-        """
-        Render the four urban-signal charts. If the dataset lacks detector/TLS,
-        return empty figures with explanatory titles.
-        """
+    def update_urban_signals(selected_int):
+        """Render urban-signal time-series line charts for selected intersection."""
         def empty_fig(title):
             fig = go.Figure()
-            fig.update_layout(title=title, template="simple_white")
+            fig.update_layout(title=title, template="paper_pub")
             return fig
 
-        # Detect whether urban-signal data exists (the analysis layer may skip/compute earlier)
-        has_paog = hasattr(metrics, 'paog_by_detector') and isinstance(metrics.paog_by_detector, dict) and any(metrics.paog_by_detector.values())
-        has_gor  = hasattr(metrics, 'gor_values') and isinstance(metrics.gor_values, dict) and ('all' in metrics.gor_values)
-        has_tts = hasattr(metrics, 'time_to_service_values') and isinstance(metrics.time_to_service_values, dict) and ('avg' in metrics.time_to_service_values)
-        has_app_delay = hasattr(metrics, 'approach_delay_values') and isinstance(metrics.approach_delay_values, dict)
+        def _filter_ts(vals_attr, int_id):
+            vals = getattr(metrics, vals_attr, None)
+            if not isinstance(vals, dict):
+                return []
+            ts = vals.get("timeseries", [])
+            if not ts:
+                return ts
+            if int_id and int_id != "all":
+                return [r for r in ts if r.get("intersection_id") == int_id]
+            return ts
 
-        # 1) PAOG
-        if has_paog:
-            # Expand paog_by_detector: dict[lane] -> list[{begin,end,paog,...}]
-            rows = []
-            for lane, recs in metrics.paog_by_detector.items():
-                for r in recs:
-                    # Use the interval midpoint as a time stamp
-                    t_mid = (r['begin'] + r['end']) / 2.0
-                    rows.append({'Lane': lane, 'Time': t_mid, 'PAOG': r.get('paog', None)})
-            paog_df = pd.DataFrame(rows).dropna(subset=['PAOG'])
-            if not paog_df.empty:
-                # Aggregate by time (mean)
-                avg_paog_df = paog_df.groupby('Time', as_index=False)['PAOG'].mean()
-                paog_fig = px.line(avg_paog_df, x='Time', y='PAOG',
-                                   title='Average Percent Arrivals on Green (PAOG)',
-                                   markers=True, template='simple_white')
-                paog_fig.update_yaxes(range=[0, 1], tickformat='.0%')
-            else:
-                paog_fig = empty_fig("PAOG: No data available")
+        def _ts_to_df(ts_rows):
+            if not ts_rows:
+                return pd.DataFrame()
+            df = pd.DataFrame(ts_rows)
+            if "window_start" in df.columns:
+                df["time_min"] = df["window_start"] / 60.0
+            return df
+
+        # 1) Throughput line chart
+        tp_ts = _filter_ts("throughput_values", selected_int)
+        tp_df = _ts_to_df(tp_ts)
+        if not tp_df.empty and "vehicles_per_hour" in tp_df.columns:
+            tp_fig = go.Figure()
+            tp_fig.add_trace(go.Scatter(
+                x=tp_df["time_min"], y=tp_df["vehicles_per_hour"],
+                mode="lines+markers", name="Total",
+                line=dict(color=COLOR_MAP["Throughput"], width=2),
+            ))
+            tp_fig.update_layout(title="Throughput", template="paper_pub")
+            _apply_paper_style(tp_fig, x_title="Time", x_unit="min", y_title="Vehicles/hr")
         else:
-            paog_fig = empty_fig("PAOG: Urban signal data not available")
+            tp_fig = empty_fig("Throughput: No data")
 
-        # 2) GOR
-        if hasattr(metrics, 'gor_type') and isinstance(metrics.gor_type, dict) and any(k in metrics.gor_type for k in ('cav','hdv')):
-            rows = []
-            cav = metrics.gor_type.get('cav', None)
-            hdv = metrics.gor_type.get('hdv', None)
-            if cav is not None:
-                rows.append({'Vehicle Type': 'CAV', 'GOR': float(cav)})
-            if hdv is not None:
-                rows.append({'Vehicle Type': 'HDV', 'GOR': float(hdv)})
-            gor_df = pd.DataFrame(rows)
-            if not gor_df.empty:
-                gor_fig = px.bar(
-                    gor_df, x='Vehicle Type', y='GOR',
-                    color='Vehicle Type',
-                    category_orders={'Vehicle Type': ['HDV', 'CAV']},
-                    color_discrete_map={'HDV': COLOR_MAP['HDV'], 'CAV': COLOR_MAP['CAV']},
-                    title='Green Occupancy Ratio (GOR) by Type',
-                    text_auto='.2f', template='simple_white'
-                )
-                gor_fig.update_yaxes(range=[0, 1], tickformat='.0%')
-            else:
-                gor_fig = empty_fig("GOR: No data available")
-        elif has_gor:
-            try:
-                gor_val = metrics.gor_values.get('all', None)
-                if gor_val is None and isinstance(metrics.gor_values.get('by_type', {}), dict):
-                    bt = metrics.gor_values['by_type']
-                    cand = [bt.get('cav'), bt.get('hdv')]
-                    cand = [v for v in cand if v is not None]
-                    gor_val = max(cand) if cand else None
-                if gor_val is not None:
-                    gor_df = pd.DataFrame({'Metric': ['GOR'], 'Value': [float(gor_val)]})
-                    gor_fig = px.bar(gor_df, x='Metric', y='Value', title='Green Occupancy Ratio (GOR)',
-                                     text_auto='.2f', template='simple_white')
-                    gor_fig.update_yaxes(range=[0, 1], tickformat='.0%')
-                else:
-                    gor_fig = empty_fig("GOR: No data available")
-            except Exception:
-                gor_fig = empty_fig("GOR: No data available")
+        # 2) Average Delay line chart
+        ad_ts = _filter_ts("average_delay_values", selected_int)
+        ad_df = _ts_to_df(ad_ts)
+        if not ad_df.empty and "avg_delay_all" in ad_df.columns:
+            delay_fig = go.Figure()
+            for col, name, color in [("avg_delay_hdv", "HDV", COLOR_MAP["HDV"]),
+                                      ("avg_delay_cav", "CAV", COLOR_MAP["CAV"]),
+                                      ("avg_delay_all", "All", "#9467bd")]:
+                if col in ad_df.columns:
+                    delay_fig.add_trace(go.Scatter(
+                        x=ad_df["time_min"], y=ad_df[col],
+                        mode="lines+markers", name=name,
+                        line=dict(color=color, width=2),
+                    ))
+            delay_fig.update_layout(title="Average Delay", template="paper_pub")
+            _apply_paper_style(delay_fig, x_title="Time", x_unit="min", y_title="Avg Delay", y_unit="s")
         else:
-            gor_fig = empty_fig("GOR: Urban signal data not available")
+            delay_fig = empty_fig("Average Delay: No data")
 
-        # 3) Approach Delay (HDV vs CAV)
-        if has_app_delay:
-            ad = metrics.approach_delay_values
-            ad_df = pd.DataFrame({
-                'Vehicle Type': ['HDV', 'CAV'],
-                'Approach Delay (s)': [float(ad.get('hdv', 0.0)), float(ad.get('cav', 0.0))]
-            })
-            ad_fig = px.bar(
-                ad_df, x='Vehicle Type', y='Approach Delay (s)',
-                color='Vehicle Type',
-                category_orders={'Vehicle Type': ['HDV', 'CAV']},
-                color_discrete_map={'HDV': COLOR_MAP['HDV'], 'CAV': COLOR_MAP['CAV']},
-                title='Approach Delay (Urban Approaches)',
-                text_auto='.2f', template='simple_white'
+        # 3) Queue summary by approach
+        ql_vals = getattr(metrics, "queue_length_values", {})
+        ql_rows = []
+        if isinstance(ql_vals, dict):
+            summary_rows = ql_vals.get("summary_rows", [])
+            if summary_rows:
+                ql_rows = list(summary_rows)
+            else:
+                summary = ql_vals.get("summary", {})
+                if isinstance(summary, dict):
+                    if selected_int and selected_int != "all" and isinstance(summary.get(selected_int), list):
+                        ql_rows = list(summary.get(selected_int, []))
+                    elif selected_int and selected_int != "all" and isinstance(summary.get(selected_int), dict):
+                        ql_rows = [summary.get(selected_int)]
+
+        if selected_int and selected_int != "all":
+            ql_rows = [r for r in ql_rows if r.get("intersection_id") == selected_int]
+        else:
+            ql_rows = [r for r in ql_rows if r.get("intersection_id") != "unknown"]
+
+        ql_df = pd.DataFrame(ql_rows)
+        if not ql_df.empty and "Average Queue" in ql_df.columns:
+            if "approach_direction" not in ql_df.columns:
+                ql_df["approach_direction"] = ql_df.get("approach_edge", "")
+            ql_df["approach_label"] = ql_df["approach_direction"].astype(str)
+            ql_plot_df = ql_df.melt(
+                id_vars=["approach_label"],
+                value_vars=[c for c in ["Average Queue", "Max Queue"] if c in ql_df.columns],
+                var_name="Metric",
+                value_name="Queued Vehicles",
             )
+            ql_fig = px.bar(
+                ql_plot_df,
+                x="approach_label",
+                y="Queued Vehicles",
+                color="Metric",
+                barmode="group",
+                title="Queue by Approach",
+                template="paper_pub",
+                text_auto=".1f",
+            )
+            _apply_paper_style(ql_fig, x_title="Approach", y_title="Queued Vehicles")
+            ql_fig.update_layout(bargap=0.25)
         else:
-            ad_fig = empty_fig("Approach Delay: Urban signal data not available")
+            ql_fig = empty_fig("Queue Count: No data")
 
-        # 4) Time To Service (Avg / Max)
-        if hasattr(metrics, 'time_to_service_split') and isinstance(metrics.time_to_service_split, dict) and any(k in metrics.time_to_service_split for k in ('all','cav','hdv')):
-            ts = metrics.time_to_service_split
-            rows = []
-            cav_avg = ts.get('cav', {}).get('avg', None)
-            hdv_avg = ts.get('hdv', {}).get('avg', None)
-            if cav_avg is not None:
-                rows.append({'Vehicle Type': 'CAV', 'Avg TTS (s)': float(cav_avg)})
-            if hdv_avg is not None:
-                rows.append({'Vehicle Type': 'HDV', 'Avg TTS (s)': float(hdv_avg)})
-            tts_df = pd.DataFrame(rows)
-            if not tts_df.empty:
-                tts_fig = px.bar(
-                    tts_df, x='Vehicle Type', y='Avg TTS (s)',
-                    color='Vehicle Type',
-                    category_orders={'Vehicle Type': ['HDV', 'CAV']},
-                    color_discrete_map={'HDV': COLOR_MAP['HDV'], 'CAV': COLOR_MAP['CAV']},
-                    title='Time To Service (Average) by Type',
-                    text_auto='.2f', template='simple_white'
-                )
+        # 4) v/c Ratio line chart
+        vc_ts = _filter_ts("vc_ratio_values", selected_int)
+        vc_df = _ts_to_df(vc_ts)
+        if not vc_df.empty and "vc_ratio_avg" in vc_df.columns:
+            vc_fig = go.Figure()
+            vc_fig.add_trace(go.Scatter(
+                x=vc_df["time_min"], y=vc_df["vc_ratio_avg"],
+                mode="lines+markers", name="Avg v/c",
+                line=dict(color=COLOR_MAP["VC"], width=2),
+            ))
+            if "vc_ratio_max" in vc_df.columns:
+                vc_fig.add_trace(go.Scatter(
+                    x=vc_df["time_min"], y=vc_df["vc_ratio_max"],
+                    mode="lines", name="Critical v/c",
+                    line=dict(color=COLOR_MAP["VC"], width=1, dash="dash"),
+                ))
+            vc_fig.add_hline(y=1.0, line_dash="dot", line_color="red",
+                             annotation_text="Capacity", annotation_position="top right")
+            vc_fig.update_layout(title="v/c Ratio", template="paper_pub")
+            _apply_paper_style(vc_fig, x_title="Time", x_unit="min", y_title="v/c Ratio")
+        else:
+            vc_fig = empty_fig("v/c Ratio: No data")
+
+        # Summary cards (global or per-intersection)
+        summary_items = []
+        tp_vals = getattr(metrics, "throughput_values", {})
+        if isinstance(tp_vals, dict):
+            summary_items.append(f"Throughput: {tp_vals.get('vehicles_per_hour', 0):.0f} veh/hr")
+        ad_vals = getattr(metrics, "average_delay_values", {})
+        if isinstance(ad_vals, dict):
+            summary_items.append(f"Avg Delay: {ad_vals.get('avg_delay_all', 0):.1f}s")
+        ql_vals = getattr(metrics, "queue_length_values", {})
+        if isinstance(ql_vals, dict):
+            ql_summary_rows = ql_vals.get("summary_rows", [])
+            if selected_int and selected_int != "all":
+                ql_summary_rows = [r for r in ql_summary_rows if r.get("intersection_id") == selected_int]
+            if ql_summary_rows:
+                ql_summary_df = pd.DataFrame(ql_summary_rows)
+                summary_items.append(f"Average Queue: {float(ql_summary_df['Average Queue'].mean()):.1f} veh")
+                summary_items.append(f"Max Queue: {float(ql_summary_df['Max Queue'].max()):.1f} veh")
             else:
-                tts_fig = empty_fig("TTS: No data available")
-        elif has_tts:
-            # Legacy structure: show avg/max
-            tts_avg = float(metrics.time_to_service_values.get('avg', 0.0))
-            tts_max = float(metrics.time_to_service_values.get('max', 0.0))
-            tts_df = pd.DataFrame({
-                'Statistic': ['Average', 'Max'],
-                'Time to Service (s)': [tts_avg, tts_max]
-            })
-            tts_fig = px.bar(tts_df, x='Statistic', y='Time to Service (s)',
-                             title='Time To Service (Urban Signals)',
-                             text_auto='.2f', template='simple_white')
-        else:
-            tts_fig = empty_fig("TTS: Urban signal data not available")
+                summary_items.append(f"Average Queue: {ql_vals.get('avg_queue_vehicles', 0):.1f} veh")
+        vc_vals = getattr(metrics, "vc_ratio_values", {})
+        if isinstance(vc_vals, dict):
+            summary_items.append(f"v/c: {vc_vals.get('vc_ratio_avg', 0):.3f}")
 
-        # PAOG styling: tighten x-range to reduce side margins when data exists
-        if has_paog and 'paog_df' in locals() and not paog_df.empty and 'avg_paog_df' in locals() and not avg_paog_df.empty:
-            x_min = float(avg_paog_df['Time'].min())
-            x_max = float(avg_paog_df['Time'].max())
-            paog_fig.update_xaxes(range=[x_min, x_max])
+        cards = html.Div([
+            html.Span(item, style={"marginRight": "24px", "fontWeight": "500"})
+            for item in summary_items
+        ], style={"padding": "8px 0", "fontSize": "14px", "color": "#555"})
 
-        paog_fig.update_layout(colorway=[COLOR_MAP["PAOG"]])
-        _apply_paper_style(paog_fig, x_title="Time", x_unit="s", y_title="PAOG", is_pct=True)
-        paog_fig.update_xaxes(zeroline=False)  # ensure no vertical zero-line
+        return tp_fig, delay_fig, ql_fig, vc_fig, cards
 
-        _apply_paper_style(gor_fig, x_title=None, y_title="GOR", is_pct=True)
-        gor_fig.update_traces(width=0.5)
-        gor_fig.update_layout(bargap=0.35)
-
-        _apply_paper_style(ad_fig, x_title=None, y_title="Approach Delay", y_unit="s")
-        ad_fig.update_traces(width=0.5)
-        ad_fig.update_layout(bargap=0.35)
-
-        if hasattr(metrics, 'time_to_service_split') and isinstance(metrics.time_to_service_split, dict):
-            _apply_paper_style(tts_fig, x_title=None, y_title="Time to Service", y_unit="s")
-            tts_fig.update_traces(width=0.5)
-            tts_fig.update_layout(bargap=0.35)
-        else:
-            tts_fig.update_layout(colorway=[COLOR_MAP["TTS"]])
-            _apply_paper_style(tts_fig, x_title=None, y_title="Time to Service", y_unit="s")
-            tts_fig.update_traces(width=0.5)
-            tts_fig.update_layout(bargap=0.35)
-
-        # Force x-axis category order: HDV -> CAV
-        for _fig in (gor_fig, ad_fig, tts_fig):
-            _fig.update_xaxes(categoryorder='array', categoryarray=['HDV', 'CAV'])
-
-        return paog_fig, gor_fig, ad_fig, tts_fig
-    
     return app
 
 
@@ -1589,7 +1675,6 @@ def export_time_space_csv(
 
 
 if __name__ == '__main__':
-    print("Starting main execution...")
 
     # ---------------------------------------------------------------------
     # CLI lane filtering (sample-level) & run examples
@@ -1634,13 +1719,16 @@ if __name__ == '__main__':
                         help="Show Urban Signals tab: 'auto' (default, show when detector+TLS present), 'yes' (force show), 'no' (hide)")
     parser.add_argument('--p', '--penetration-tag', dest='p_tag', default="0",
                         help="Penetration tag for output filenames, e.g. 0.1 or p0.1. If provided, dashboard will look for fcd_<tag>.xml and stats_<tag>.xml and will use metrics_<tag>.pkl cache. Default: 0 -> p0")
-    parser.add_argument('--cav-controller', dest='cav_controller', default=None, type=str,
-                        choices=['pcc', 'cth', 'acc', 'acc_gunter', 'cacc', 'idm',
-                                 'li2018', 'gunter2020', 'sun2024', 'zhang2025',
-                                 'wen2022', 'vajedi2016', 'mosharafian2022', 'kim2021'],
-                        help="CAV controller type. If specified, will look for files with format p{penetration}_{controller}.xml")
-    parser.add_argument('--exp-tag', type=str, default='',
-                        help='Experiment tag to append to filenames (e.g., "mainlane_lc_off", "merging_lc_off")')
+    parser.add_argument('--seed', default=None, type=int,
+                        help='Optional run seed used only to keep exported dataset filenames distinct across repeated runs.')
+    parser.add_argument('--export-only', action='store_true',
+                        help='Build metrics and export dashboard datasets without starting the Dash web server.')
+    parser.add_argument('--rebuild-cache', action='store_true',
+                        help='Delete the cached metrics_<tag>.pkl before analysis so metrics are rebuilt from source files.')
+    parser.add_argument('--host', default='0.0.0.0', type=str,
+                        help='Host for the Dash server. Default 0.0.0.0')
+    parser.add_argument('--port', default=8050, type=int,
+                        help='Port for the Dash server. Default 8050')
 
     # ---- (optional) CLI lane-filtering rules ----
     parser.add_argument('--exclude-lane', action='append', default=[],
@@ -1657,28 +1745,27 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    # Normalize penetration tag argument to form like 'p0.1' or 'p0.1_acc' (or None to use defaults)
+    # Normalize penetration tag argument to form like 'p0.1' (or None to use defaults)
     if args.p_tag is None:
         pen_tag = None
     else:
         p_raw = str(args.p_tag)
         try:
             p_val = float(p_raw)
-            base_tag = f"p{p_val:g}"
+            pen_tag = f"p{p_val:g}"
         except Exception:
-            base_tag = p_raw if p_raw.startswith('p') else f"p{p_raw}"
-        
-        # Append controller name if specified
-        if args.cav_controller:
-            pen_tag = f"{base_tag}_{args.cav_controller}"
-        else:
-            pen_tag = base_tag
-        
-        # Append experiment tag if specified
-        if args.exp_tag:
-            pen_tag = f"{pen_tag}_{args.exp_tag}"
+            pen_tag = p_raw if p_raw.startswith('p') else f"p{p_raw}"
 
     output_path = os.path.join(args.scenario_folder, args.scenario, 'output')
+
+    if args.rebuild_cache:
+        cache_path = os.path.join(output_path, f"metrics_{pen_tag}.pkl")
+        if os.path.exists(cache_path):
+            try:
+                os.remove(cache_path)
+                print(f"Deleted cached metrics file: {cache_path}")
+            except Exception as e:
+                print(f"[WARN] Failed to delete cached metrics file {cache_path}: {e}")
 
     # -------------------- Build LaneSelector (sample-level filtering) --------------------
     selector = None
@@ -1706,9 +1793,11 @@ if __name__ == '__main__':
                 print(f"[WARN] Bad --lane-pos-window '{spec}': {e}")
 
     # -------------------- Key step: pass selector + enable sample-level mode --------------------
+    enable_urban_metrics = args.urban != 'no'
+
     metrics = load_or_build_metrics(
         file_dir=output_path,
-        urban_mode=False,
+        urban_mode=enable_urban_metrics,
         lane_selector=selector,
         strict_vehicle_filter="sample",  # Sample-level filtering; keeps the same vehicle’s samples on allowed lanes
         penetration_tag=pen_tag,
@@ -1716,20 +1805,11 @@ if __name__ == '__main__':
 
     export_spillback(metrics, out_dir=output_path)
 
-    # Call exporters (run_label uses scenario + CAV penetration + controller for clarity)
+    # Call exporters (run_label uses scenario + CAV penetration for clarity)
     output_excel = os.path.join(args.scenario_folder, args.scenario, 'excel_file')
-    cav_percent = int(100 * (metrics.num_cavs / max(1, metrics.num_cavs + metrics.num_hdvs)))
-    
-    # Build run_label with controller name if specified
-    if args.cav_controller:
-        run_label = f"{args.scenario}_cav{cav_percent}_{args.cav_controller}"
-    else:
-        run_label = f"{args.scenario}_cav{cav_percent}"
-    
-    # Append exp_tag if provided
-    if args.exp_tag:
-        run_label = f"{run_label}_{args.exp_tag}"
-    
+    actual_cav_pct = int(100 * (metrics.num_cavs / max(1, metrics.num_cavs + metrics.num_hdvs)))
+    seed_suffix = f"_seed{int(args.seed)}" if args.seed is not None else ""
+    run_label = f"{args.scenario}_{pen_tag}{seed_suffix}_cav{actual_cav_pct}"
     time_space_name = f"{run_label}_timespace.csv.gz"
 
     """
@@ -1749,13 +1829,13 @@ if __name__ == '__main__':
 
     export_dashboard_datasets(metrics, out_dir=output_excel, run_label=run_label)
 
-    print(f"Metrics downloaded to {output_excel}")
+    print(f"[EXPORT] Metrics and plot-ready datasets saved to: {output_excel}")
 
-    print("Creating dashboard...")
+    if args.export_only:
+        print("Export-only mode enabled. Skipping Dash server startup.")
+        raise SystemExit(0)
+
     app = create_dashboard(metrics, direction=args.direction, urban_mode=args.urban)
-
-    print("Starting Flask development server...")
-    app.run(debug=False, host='0.0.0.0', port=8050)
-
+    app.run(debug=False, host=args.host, port=args.port)
 
 

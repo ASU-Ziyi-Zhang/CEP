@@ -47,51 +47,52 @@ class inputs(Structure):
     # struct ExtU_longitudinal_mpc_T {
     #   real_T t;                            /* '<Root>/t' */
     #   real_T ego_state[3];                 /* '<Root>/ego_state' */
-    #   real_T pos_pred[201];                 /* '<Root>/pos_pred' */
-    #   real_T vel_pred[201];                 /* '<Root>/vel_pred' */
-    #   real_T acc_pred[201];                 /* '<Root>/acc_pred' */
-    #   real_T time_pred[201];                /* '<Root>/time_pred' */
-    #   real_T pos_max;                      /* '<Root>/pos_max' */
-    #   real_T vel_max;                      /* '<Root>/vel_max' */
+    #   real_T pv_state[3];                  /* '<Root>/pv_state' */
+    #   real_T pos_pred[201];                /* '<Root>/pos_pred' */
+    #   real_T vel_pred[201];                /* '<Root>/vel_pred' */
+    #   real_T acc_pred[201];                /* '<Root>/acc_pred' */
+    #   real_T time_pred[201];               /* '<Root>/time_pred' */
+    #   real_T param_vec[21];                /* '<Root>/param_vec' */
     # };
     '''Create a ctypes struct to match ExtU_<model_name>_T'''
     _fields_ = [
         ('t', c_double),
         ('ego_state', c_double * 3),
+        ('pv_state', c_double * 3),
         ('pos_pred', c_double * 201),
         ('vel_pred', c_double * 201),
         ('acc_pred', c_double * 201),
         ('time_pred', c_double * 201),
-        ('pos_max', c_double),
-        ('vel_max', c_double)
+        ('param_vec', c_double * 21)
     ]
 
 class outputs(Structure):
     ### From the longitudinal_mpc0.h autogen file
-    # /* External outputs (root outports fed by signals with default storage) */
-    # struct ExtY_longitudinal_mpc0_T {
-    #     real_T acc_des;                      /* '<Root>/acc_des' */
-    #     real_T state_trajectory[96];         /* '<Root>/state_trajectory' */
-    #     real_T control_trajectory[32];       /* '<Root>/control_trajectory' */
-    #     real_T time_trajectory[32];          /* '<Root>/time_trajectory' */
-    #     real_T slacks[4];                    /* '<Root>/slacks' */
-    #     real_T reference[3];                 /* '<Root>/reference' */
-    #     real_T constraint;                   /* '<Root>/constraint' */
-    #     real_T cost;                         /* '<Root>/cost' */
-    #     flags exitflag;                      /* '<Root>/exitflag' */
+    # struct ExtY_longitudinal_mpc_T {
+    #   real_T acc_des;                      /* '<Root>/acc_des' */
+    #   real_T state_trajectory[128];        /* '<Root>/state_trajectory' */
+    #   real_T control_trajectory[32];       /* '<Root>/control_trajectory' */
+    #   real_T time_trajectory[32];          /* '<Root>/time_trajectory' */
+    #   real_T slacks[5];                    /* '<Root>/slacks' */
+    #   real_T reference[4];                 /* '<Root>/reference' */
+    #   real_T constraint;                   /* '<Root>/constraint' */
+    #   real_T cost;                         /* '<Root>/cost' */
+    #   flags exitflag;                      /* '<Root>/exitflag' */
+    #   real_T iters;                        /* '<Root>/iters' */
     # };
 
     '''Create a ctypes struct to match ExtY_<model_name>_T'''
     _fields_ = [
         ('acc_des', c_double),
-        ('state_trajectory', c_double * 96),
+        ('state_trajectory', c_double * (4*32)),
         ('control_trajectory', c_double * 32),
         ('time_trajectory', c_double * 32),
-        ('slacks', c_double * 4),
-        ('reference', c_double * 3),
+        ('slacks', c_double * 5),
+        ('reference', c_double * 4),
         ('constraint', c_double),
         ('cost', c_double),
-        ('exitflag', c_int) # flags is a custom enum structure - will just cast to an int "unsafely"
+        ('exitflag', c_int), # flags is a custom enum structure - will just cast to an int "unsafely"
+        ('iters', c_double)
     ]
 
 class cpp_api(object):
@@ -214,7 +215,7 @@ class cpp_api(object):
         self.initialize()
 
         # Print success status
-        print(f'CWrapper constructed for {file}')
+        print(f'C++ Wrapper constructed for {file}')
 
     def step_inputs(self):
         '''Readies the controller inputs struct for use in the control step'''

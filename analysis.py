@@ -1,5 +1,5 @@
 """
-Author: Yanbing Wang, Ziyi Zhang
+Author: Ziyi Zhang Yanbing Wang
 This script supports post-simulation analysis. Planned/implemented metrics include:
 
 0. Visualizations & Statistics
@@ -10,31 +10,31 @@ This script supports post-simulation analysis. Planned/implemented metrics inclu
 1. Safety
     a. DONE TTC distribution
     b. DONE PET distribution
-    c. Proportion of Stopping Distance (PSD). A PSD value < 1 indicates an unsafe situation,
+    c. DONE Time headway distribution (HDV and CAV)
+    d. Proportion of Stopping Distance (PSD). A PSD value < 1 indicates an unsafe situation,
        since a collision cannot be avoided even with maximum deceleration.
-    d. DONE Deceleration Rate to Avoid a Crash (DRAC)
+    e. DONE Deceleration Rate to Avoid a Crash (DRAC)
 
-2. Throughput & Stability
+2. Mobility
     a. Throughput vs. penetration rate
     b. DONE Total delay
     c. Lane-specific travel time
     d. Level of service
-    e. DONE Average speed
+    c. DONE Average speed
     - Queue length: average/maximum length of vehicle queues at intersections or bottlenecks.
     - Stop time: total time vehicles spend stopped or idling during the simulation.
 
-3. Fuel Consumption
+3. Environmental impact
     a. Emissions
-    b. DONE Fuel consumption rate
+    b. Fuel consumption rate
 
-4. Interaction with Other Drivers
+4. Behavioral
     a. Overtaking rate (frequency and duration of overtaking maneuvers)
     b. DONE HDV/CAV following gap distribution
     c. DONE Lane-change frequency (number of lane changes per vehicle)
     d. Lane-change duration
     e. Reaction time
     f. Gap acceptance (accepted gaps during lane changes or merges)
-    g. DONE Time headway distribution (HDV and CAV)
 
 5. Macroscopic characteristics
     a. Shockwave propagation: extent/intensity of stop‑and‑go waves in the traffic stream.
@@ -61,6 +61,37 @@ SUMO output files
 
 3) by_edge.xml, by_lane.xml
 """
+
+'''
+ZY [10/17/2025]
+1) Introduced an "urban_mode" switch and a full urban‑signal analytics pipeline:
+   - Parsers for TLS time‑series/static tlLogic, detector outputs, and add.xml lane mapping;
+     composed detector→lane→TLS mapping.
+   - Implemented urban metrics: throughput, average delay, queue length, v/c ratio,
+     intersection approach delay, and queue spillback detection, with optional partial
+     execution when only detector data is available.
+   - Built green-window extraction and lane-occupancy grids to support the above metrics.
+
+2) Added `load_or_build_metrics(file_dir, urban_mode)` as a cache loader:
+   - Computes an input‑file signature (mtime + size) and reuses `metrics_p0.1t.pkl` when
+     inputs are unchanged; auto‑rebuilds the cache when they differ.
+   - Enables the Dashboard to load metrics without recomputing when prior results exist.
+
+3) Added robust gating/limits & sanitization knobs for FCD/XML parsing and metric stability:
+   - Gates: `POS_MIN_ANALYSIS`, `TT_USE_POS_GATE`, `ENERGY_USE_POS_GATE`.
+   - Bounds: `V_MAX`, `ACC_MIN`/`ACC_MAX`, `HW_V_EPS`.
+   - Visualization bounds: `SPEED_MIN_HIST`, `SPEED_MAX_HIST`, `ACC_MAX_HIST`.
+   - Sanitization thresholds for PET/TTC/headway/space‑gap to remove numerical artifacts.
+
+4) Reworked `fuel_rate_g_per_s` (fuel model):
+   - Physics‑based traction‑power + auxiliaries with an idle floor and BSFC conversion (g/s),
+     numerically stable at low speed/load; unified, easily tunable parameters (mass, CdA, Crr).
+
+
+'''
+
+
+
 import xml.etree.ElementTree as ET
 import numpy as np
 from math import nan, isnan
@@ -79,6 +110,14 @@ from typing import List, Tuple
 import re
 from typing import Optional, Iterable, Set, Dict, Any, Tuple, List
 import bisect
+
+# Bump this version whenever metric computation logic changes (e.g. queue
+# rewrite, new output schema) so that stale .pkl caches are automatically
+# invalidated even though the *input* files haven't changed.
+_METRICS_CODE_VERSION = 2  # v2: cycle-based queue with summary_rows/cycle_records
+
+# When False, suppress [DEBUG] / informational prints; keep CACHE/EXPORT/WARN/ERROR.
+_VERBOSE = False
 
 
 class LaneSelector:
@@ -345,6 +384,108 @@ def _abs_or_join(base_dir: str, path: str) -> str:
         return path
     return path if os.path.isabs(path) else os.path.join(base_dir, path)
 
+def _infer_scenario_root(file_dir: str) -> str:
+    """
+    Infer the scenario root directory from an analysis input directory.
+    Typical input is <scenario>/output, but callers may also pass <scenario>.
+    """
+    if not file_dir:
+        return file_dir
+    norm = os.path.normpath(file_dir)
+    if os.path.basename(norm).lower() == "output":
+        return os.path.dirname(norm)
+    return norm
+
+def _first_existing(paths: List[str]) -> str | None:
+    """Return the first existing path from a candidate list."""
+    for path in paths:
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+def _discover_urban_support_files(file_dir: str, penetration_tag: str | None = None) -> dict:
+    """
+    Discover detector/TLS/additional/mapping files for the current scenario.
+    """
+    scenario_dir = _infer_scenario_root(file_dir)
+    scenario_name = os.path.basename(scenario_dir.rstrip("\\/"))
+
+    detector_candidates = []
+    if penetration_tag:
+        detector_candidates.extend([
+            os.path.join(file_dir, f"detector_output_{penetration_tag}.xml"),
+            os.path.join(scenario_dir, f"detector_output_{penetration_tag}.xml"),
+        ])
+    detector_candidates.extend([
+        os.path.join(file_dir, "detector_output.xml"),
+        os.path.join(scenario_dir, "detector_output.xml"),
+    ])
+    detector_file = _first_existing(detector_candidates)
+    mapping_file = _first_existing([
+        os.path.join(scenario_dir, "detector_mapping.json"),
+        os.path.join(file_dir, "detector_mapping.json"),
+    ])
+    add_file = _first_existing([
+        os.path.join(scenario_dir, "sensors.add.xml"),
+        os.path.join(scenario_dir, "detectors.add.xml"),
+    ])
+    signal_file = _first_existing([
+        os.path.join(scenario_dir, "signal.add.xml"),
+    ])
+    tls_candidates = []
+    if penetration_tag:
+        tls_candidates.extend([
+            os.path.join(file_dir, f"tls_{penetration_tag}.xml"),
+            os.path.join(scenario_dir, f"tls_{penetration_tag}.xml"),
+        ])
+    tls_candidates.extend([
+        os.path.join(file_dir, "tls.xml"),
+        os.path.join(scenario_dir, "tls.xml"),
+    ])
+    tls_file = _first_existing(tls_candidates)
+    net_file = _first_existing([
+        os.path.join(scenario_dir, f"{scenario_name}.net.xml"),
+    ])
+
+    if net_file is None and os.path.isdir(scenario_dir):
+        net_candidates = sorted(
+            os.path.join(scenario_dir, name)
+            for name in os.listdir(scenario_dir)
+            if name.endswith(".net.xml")
+        )
+        net_file = net_candidates[0] if net_candidates else None
+
+    if tls_file is None:
+        tls_file = net_file
+
+    return {
+        "scenario_dir": scenario_dir,
+        "scenario_name": scenario_name,
+        "detector_file": detector_file,
+        "mapping_file": mapping_file,
+        "add_file": add_file,
+        "signal_file": signal_file,
+        "tls_file": tls_file,
+        "net_file": net_file,
+    }
+
+
+TRAFFIC_LIGHT_SCENARIOS = {"chi_clinton_canal", "roosevelt", "roosevelt_simple"}
+DEFAULT_TRAFFIC_LIGHT_WARMUP_S = 350.0
+
+
+def _default_evaluation_start_s(file_dir: str) -> float:
+    """
+    Match main.py behavior:
+    - traffic-light scenarios use a 350 s warm-up
+    - highway / merging scenarios evaluate from 0 s
+    """
+    scenario_dir = _infer_scenario_root(file_dir)
+    scenario_name = os.path.basename(scenario_dir.rstrip("\\/")).lower()
+    if scenario_name in TRAFFIC_LIGHT_SCENARIOS:
+        return DEFAULT_TRAFFIC_LIGHT_WARMUP_S
+    return 0.0
+
 def _selector_signature(lane_selector) -> dict | None:
     """
     Build a JSON-serializable signature of the LaneSelector so that changes
@@ -385,12 +526,35 @@ def _selector_signature(lane_selector) -> dict | None:
     }
     return sig
 
+
+def _parse_xml_tree_resilient(xml_path: str, label: str = "XML") -> ET.ElementTree:
+    """
+    Parse an XML file, stripping embedded NUL bytes if needed.
+
+    This makes the post-processing pipeline more tolerant of partially
+    corrupted SUMO outputs from prior runs while still surfacing truly
+    malformed XML.
+    """
+    try:
+        return ET.parse(xml_path)
+    except ET.ParseError:
+        with open(xml_path, "rb") as f:
+            raw = f.read()
+        nul_count = raw.count(b"\x00")
+        if nul_count <= 0:
+            raise
+        cleaned = raw.replace(b"\x00", b"")
+        root = ET.fromstring(cleaned)
+        print(f"[Warning] Removed {nul_count} NUL bytes from {label} file: {xml_path}")
+        return ET.ElementTree(root)
+
 def load_or_build_metrics(
     file_dir: str,
     urban_mode: bool = True,
     lane_selector=None,
     strict_vehicle_filter: str = "sample",
     penetration_tag: str | None = None,
+    evaluation_start_s: float | None = None,
 ):
     """
     Load metrics cache if present and valid; otherwise build from scratch.
@@ -419,6 +583,7 @@ def load_or_build_metrics(
     """
     # Build penetration tag for filenames (default kept for backward compatibility)
     pen_tag = penetration_tag if penetration_tag is not None else "p0"
+    eval_start_s = _default_evaluation_start_s(file_dir) if evaluation_start_s is None else float(evaluation_start_s)
 
     # Cache file name (use penetration tag so caches for different penetrations don't collide)
     pkl = os.path.join(file_dir, f"metrics_{pen_tag}.pkl")
@@ -429,19 +594,25 @@ def load_or_build_metrics(
     files_for_sig = [fcd_path]
 
     if urban_mode:
-        # Use absolute paths as-is; join relative ones to file_dir.
-        det_path = _abs_or_join(file_dir, "sumo_scenarios/roosevelt/detector_output.xml")
-        tls_path = _abs_or_join(file_dir, "sumo_scenarios/roosevelt/tls.xml")
-        files_for_sig.extend([det_path, tls_path])
+        urban_files = _discover_urban_support_files(file_dir, pen_tag)
+        files_for_sig.extend([
+            urban_files.get("detector_file"),
+            urban_files.get("tls_file"),
+            urban_files.get("add_file"),
+            urban_files.get("mapping_file"),
+            urban_files.get("net_file"),
+        ])
 
     # File signature (mtime + size)
     file_sig, _ = _file_sig(files_for_sig)
 
-    # Config signature (urban flag + filtering configuration)
+    # Config signature (urban flag + filtering configuration + code version)
     cfg = {
         "urban_mode": bool(urban_mode),
         "strict_vehicle_filter": str(strict_vehicle_filter or "sample"),
         "lane_selector": _selector_signature(lane_selector),
+        "evaluation_start_s": eval_start_s,
+        "code_version": _METRICS_CODE_VERSION,
     }
     cfg_json = json.dumps(cfg, sort_keys=True, ensure_ascii=False, default=str)
     cfg_sig = hashlib.sha1(cfg_json.encode("utf-8")).hexdigest()
@@ -473,6 +644,7 @@ def load_or_build_metrics(
         strict_vehicle_filter=strict_vehicle_filter,
         cache_sig=cur_sig,
         penetration_tag=pen_tag,
+        evaluation_start_s=eval_start_s,
     )
     with open(pkl, "wb") as f:
         dill.dump(m, f)
@@ -481,6 +653,18 @@ def load_or_build_metrics(
     return m
 
 EPS = 1e-9  # for half-open intervals [start, end)
+
+
+def _build_time_windows(t_min, t_max, window_s=300.0):
+    """Generate fixed-width (start, end) time-window tuples."""
+    if t_max <= t_min or window_s <= 0:
+        return []
+    windows = []
+    t = t_min
+    while t < t_max - 1e-9:
+        windows.append((t, min(t + window_s, t_max)))
+        t += window_s
+    return windows
 
 def _coalesce_tls_states(time_states):
     """
@@ -549,7 +733,7 @@ def _clipMoreThan(metric, threshold):
 class TrafficMetrics:
     def __init__(self, file_dir, save_metrics=True, urban_mode=False,
                  lane_selector=None, strict_vehicle_filter="sample", cache_sig=None,
-                 penetration_tag: str | None = None):
+                 penetration_tag: str | None = None, evaluation_start_s: float | None = None):
         """
         Initialize TrafficMetrics.
 
@@ -566,6 +750,10 @@ class TrafficMetrics:
         self.is_sanitizing = True  
         self.lane_selector = lane_selector
         self.strict_vehicle_filter = strict_vehicle_filter
+        self.evaluation_start_s = (
+            _default_evaluation_start_s(file_dir)
+            if evaluation_start_s is None else float(evaluation_start_s)
+        )
 
         # ===== Low memory defaults =====
         self.BUILD_LANE_GRID   = True 
@@ -608,6 +796,9 @@ class TrafficMetrics:
         if os.path.isfile(stats_path):
             self.stats_path = stats_path
             self.parse_stats(stats_path)
+            if isinstance(getattr(self, "simulation_stats", None), dict):
+                self.simulation_stats.setdefault("evaluation", {})
+                self.simulation_stats["evaluation"]["start_time_s"] = self.evaluation_start_s
 
         # Analysis gates and defaults (overridable by setting same-named attributes)
         self.POS_MIN_ANALYSIS    = getattr(self, "POS_MIN_ANALYSIS", 100.0)
@@ -667,32 +858,41 @@ class TrafficMetrics:
 
         # ----------- Urban‑mode specific -----------
         if urban_mode:
-            mapping_file = os.path.join(file_dir, "sumo_scenarios/roosevelt/detector_mapping.json")
-            self.detector_file = os.path.join(file_dir, "sumo_scenarios/roosevelt/detector_output.xml")
-            self.tls_file = os.path.join(file_dir, "sumo_scenarios/roosevelt/tls.xml")
-            self.add_file = os.path.join(file_dir, "sumo_scenarios/roosevelt/sensors.add.xml") 
+            urban_files = _discover_urban_support_files(file_dir, self.penetration_tag)
+            self.urban_support_files = urban_files
+            mapping_file = urban_files.get("mapping_file")
+            self.detector_file = urban_files.get("detector_file")
+            self.tls_file = urban_files.get("tls_file")
+            self.add_file = urban_files.get("add_file")
+            self.net_file = urban_files.get("net_file")
 
-            if os.path.exists(mapping_file):
+            if mapping_file and os.path.exists(mapping_file):
                 with open(mapping_file, "r") as f:
                     self.detector_mapping = json.load(f)
             else:
                 self.detector_mapping = {}
                 print(f"[Warning] Mapping file not found: {mapping_file}")
             
-            if os.path.isfile(self.detector_file) and os.path.isfile(self.tls_file):
+            if self.detector_file and os.path.isfile(self.detector_file) and self.tls_file and os.path.isfile(self.tls_file):
                 self.det2lane = self.parse_add_detectors_to_map(self.add_file)
                 self.lane_map = self.load_lane_tls_mapping_json(mapping_file)
-                self.detector_mapping = self._compose_detector_mapping(self.det2lane, self.lane_map)
+                if self.lane_map:
+                    self.detector_mapping = self._compose_detector_mapping(self.det2lane, self.lane_map)
+                elif self.net_file:
+                    self.lane_map = self.build_lane_tls_mapping_from_net(self.net_file)
+                    self.detector_mapping = self.build_detector_mapping_from_net(self.det2lane, self.net_file)
+                else:
+                    self.detector_mapping = self._compose_detector_mapping(self.det2lane, self.lane_map)
 
                 self.parse_detector_data(self.detector_file)
                 self.parse_tls_data(self.tls_file)
                 self._run_city_signal_metrics_if_applicable()
             else:
                 print("[Urban] Detector/TLS file not found, skipping signal metrics.")
-                self.detector_file, self.tls_file, self.add_file = None, None, None
+                self.detector_file, self.tls_file, self.add_file, self.net_file = None, None, None, None
         else:
             print("[Init] Urban mode disabled, skipping detector/tls/add files.")
-            self.detector_file, self.tls_file, self.add_file = None, None, None
+            self.detector_file, self.tls_file, self.add_file, self.net_file = None, None, None, None
    
         # ----------- Cache signature -----------
         if cache_sig is None:
@@ -800,6 +1000,7 @@ class TrafficMetrics:
         lane_pos_all = None
         present_hdv_g = None
         present_cav_g = None
+        skip_timestep = False
 
         # ==== streaming parse ====
         context = ET.iterparse(self.fcd_file, events=("start", "end"))
@@ -817,6 +1018,9 @@ class TrafficMetrics:
             # -- timestep start
             if tag == "timestep" and event == "start":
                 cur_time = float(elem.get("time"))
+                skip_timestep = cur_time < self.evaluation_start_s
+                if skip_timestep:
+                    continue
                 step_idx += 1
                 if first_time is None:
                     first_time = cur_time
@@ -835,11 +1039,12 @@ class TrafficMetrics:
 
             # -- vehicle end
             elif tag == "vehicle" and event == "end":
+                if skip_timestep:
+                    elem.clear()
+                    continue
                 try:
                     vid   = elem.get("id")
-                    vtype_raw = (elem.get("type") or "hdv").lower()
-                    # Normalize: all cav_* variants -> 'cav'
-                    vtype = "cav" if vtype_raw.startswith("cav") else vtype_raw
+                    vtype = (elem.get("type") or "hdv").lower()
                     lane  = elem.get("lane") or ""
                     pos   = float(elem.get("pos"))
                     x     = float(elem.get("x"))
@@ -942,6 +1147,10 @@ class TrafficMetrics:
 
             # -- timestep end
             elif tag == "timestep" and event == "end":
+                if skip_timestep:
+                    elem.clear()
+                    prev_time = cur_time
+                    continue
                 # time axis + presence (gated)
                 self.timesteps.append(cur_time)
                 self.num_hdvs_per_timestep.append(len(present_hdv_g or ()))
@@ -1090,8 +1299,7 @@ class TrafficMetrics:
                 if (dist_m is None) or not np.isfinite(dist_m):
                     traj = (self.positions.get(vt, {}) or {}).get(vid, [])
                     if traj:
-
-                        dist_m = max(0.0, float(traj[-1][1]))
+                        dist_m = max(0.0, float(traj[-1][1]) - float(traj[0][1]))
                     else:
                         dist_m = 0.0
 
@@ -1747,7 +1955,7 @@ class TrafficMetrics:
             print(f"[Warning] Detector file not found: {detector_file}")
             return
 
-        tree = ET.parse(detector_file)
+        tree = _parse_xml_tree_resilient(detector_file, label="detector")
         root = tree.getroot()
         for interval in root.findall(".//interval"):
             try:
@@ -1761,6 +1969,9 @@ class TrafficMetrics:
                 nVeh = int(float(interval.attrib.get("nVehEntered", interval.attrib.get("nVeh", 0))))
             except Exception:
                 continue
+            if end <= self.evaluation_start_s:
+                continue
+            begin = max(begin, self.evaluation_start_s)
             rec = {"id": det_id, "lane": lane_id, "begin": begin, "end": end, "occ": occ, "nVeh": nVeh}
             self.detector_data.append(rec)
             self.detector_by_lane[lane_id].append(rec)
@@ -1792,7 +2003,7 @@ class TrafficMetrics:
             print(f"[Warning] TLS file not found: {tls_file}")
             return
 
-        tree = ET.parse(tls_file)
+        tree = _parse_xml_tree_resilient(tls_file, label="TLS")
         root = tree.getroot()
 
         def tag_endswith(elem, name):
@@ -1803,6 +2014,8 @@ class TrafficMetrics:
         if len(timesteps) > 0:
             for ts in timesteps:
                 t = float(ts.attrib.get("time", 0.0))
+                if t < self.evaluation_start_s:
+                    continue
 
                 # Normal children (<tls> in netstate-dump; sometimes <tl> / <tlLogic>)
                 for child in ts:
@@ -1826,10 +2039,31 @@ class TrafficMetrics:
                 self.tls_intervals[tls_id] = intervals
                 self.tls_interval_index[tls_id] = _build_interval_index(intervals)
 
+        # --- Case B: tlsStates / tlsState dump generated by SaveTLSStates ---
+        elif root.tag.split('}')[-1] == "tlsStates" or len(root.findall(".//tlsState")) > 0:
+            for item in root.findall(".//tlsState"):
+                try:
+                    t = float(item.attrib.get("time", 0.0))
+                except Exception:
+                    continue
+                if t < self.evaluation_start_s:
+                    continue
+                tls_id = item.attrib.get("id") or item.attrib.get("tlsID") or item.attrib.get("name")
+                state = item.attrib.get("state")
+                if tls_id and state is not None:
+                    self.tls_time_states[tls_id].append((t, state))
+
+            for tls_id, seq in self.tls_time_states.items():
+                seq.sort(key=lambda x: x[0])
+                intervals = _coalesce_tls_states(seq)
+                self.tls_intervals[tls_id] = intervals
+                self.tls_interval_index[tls_id] = _build_interval_index(intervals)
+
         else:
-            # --- Case B: static tlLogic in net.xml ---
+            # --- Case C: static tlLogic in net.xml ---
             for tl in root.findall(".//tlLogic"):
                 tls_id = tl.attrib.get("id")
+                program_id = tl.attrib.get("programID")
                 phases = []
                 for ph in tl.findall("phase"):
                     st = ph.attrib.get("state")
@@ -1837,18 +2071,20 @@ class TrafficMetrics:
                     if st is not None:
                         phases.append({"state": st, "duration": dur})
                 if tls_id and phases:
-                    self.tls_programs[tls_id] = phases
+                    # Prefer program 0 when multiple static programs exist for the same TLS.
+                    if tls_id not in self.tls_programs or program_id == "0":
+                        self.tls_programs[tls_id] = phases
 
         # Sort time series (for backward compatibility)
         for tls_id in list(self.tls_time_states.keys()):
             self.tls_time_states[tls_id].sort(key=lambda x: x[0])
 
-        total = sum(len(v) for v in self.tls_time_states.values())
-        print(f"[Urban Signals][DEBUG] tls time-states captured: n_tls={len(self.tls_time_states)}, samples={total}")
-        # Extra debug for intervals
-        total_intervals = sum(len(v) for v in self.tls_intervals.values())
-        if total_intervals:
-            print(f"[Urban Signals][DEBUG] tls intervals built: n_tls={len(self.tls_intervals)}, intervals={total_intervals}")
+        if _VERBOSE:
+            total = sum(len(v) for v in self.tls_time_states.values())
+            print(f"[Urban Signals][DEBUG] tls time-states captured: n_tls={len(self.tls_time_states)}, samples={total}")
+            total_intervals = sum(len(v) for v in self.tls_intervals.values())
+            if total_intervals:
+                print(f"[Urban Signals][DEBUG] tls intervals built: n_tls={len(self.tls_intervals)}, intervals={total_intervals}")
 
     def _has_detector_data(self):
         """
@@ -1899,7 +2135,42 @@ class TrafficMetrics:
         chosen_tls : str or None
             TLS ID used when multiple programs are present.
         """
+        groups = None if movement_col is None else [movement_col]
+        return self._get_green_windows_for_groups(
+            tls_id=tls_id,
+            groups=groups,
+            count_yellow_as_green=False,
+        )
+
+    def _get_green_windows_for_groups(self, tls_id=None, groups=None, count_yellow_as_green=False):
+        """
+        Build green windows for a specific TLS and optional signal-group list.
+
+        If `groups` is provided, the window is green only when all listed signal
+        groups are green simultaneously. If not provided, any green in the state
+        string qualifies.
+        """
         green_windows = []
+        green_set = {'g', 'G'}
+        if count_yellow_as_green:
+            green_set |= {'y', 'Y'}
+
+        if groups is not None:
+            try:
+                groups = [int(g) for g in groups]
+            except Exception:
+                groups = None
+
+        def state_is_green(state):
+            if state is None:
+                return False
+            s = str(state)
+            if groups:
+                for gi in groups:
+                    if gi < 0 or gi >= len(s) or s[gi] not in green_set:
+                        return False
+                return True
+            return any(ch in green_set for ch in s)
 
         # --- Static program ---
         if self.tls_programs:
@@ -1908,14 +2179,7 @@ class TrafficMetrics:
             t = 0.0
             for ph in phases:
                 dur = float(ph["duration"])
-                st = (ph["state"] or "")
-                is_green_phase = False
-                if movement_col is None:
-                    is_green_phase = any(_is_green_char(c) for c in st)
-                else:
-                    if movement_col < len(st) and _is_green_char(st[movement_col]):
-                        is_green_phase = True
-                if is_green_phase:
+                if state_is_green(ph.get("state")):
                     green_windows.append((t, t + dur))
                 t += dur
             return green_windows, True, t, chosen
@@ -1925,16 +2189,8 @@ class TrafficMetrics:
             chosen = tls_id or next(iter(self.tls_intervals.keys()))
             intervals = self.tls_intervals.get(chosen, [])
             cur_start = None
-
-            def interval_has_green(state):
-                if movement_col is None:
-                    return any(_is_green_char(c) for c in state)
-                if movement_col < len(state):
-                    return _is_green_char(state[movement_col])
-                return False
-
             for a, b, s in intervals:
-                if interval_has_green(s):
+                if state_is_green(s):
                     if cur_start is None:
                         cur_start = a
                 else:
@@ -1952,15 +2208,173 @@ class TrafficMetrics:
             for i in range(len(series) - 1):
                 t0, st0 = series[i]
                 t1, _ = series[i + 1]
-                if movement_col is None:
-                    is_green = any(_is_green_char(c) for c in (st0 or ""))
-                else:
-                    is_green = (movement_col < len(st0)) and _is_green_char(st0[movement_col])
-                if is_green:
+                if state_is_green(st0):
                     green_windows.append((t0, t1))
             return green_windows, False, None, chosen
 
         return [], False, None, None
+
+    def _resolve_detector_control(self, detector_record, detector_mapping=None):
+        """
+        Resolve detector metadata into lane / tls / groups.
+        """
+        if detector_mapping is None and hasattr(self, "detector_mapping"):
+            detector_mapping = self.detector_mapping
+
+        det_id = (
+            detector_record.get("id")
+            or detector_record.get("detector_id")
+            or detector_record.get("lane")
+        )
+        mapped = detector_mapping.get(det_id, {}) if isinstance(detector_mapping, dict) else {}
+        lane_id = (
+            mapped.get("sumo_lane")
+            or mapped.get("lane_id")
+            or detector_record.get("lane_id")
+            or detector_record.get("sumo_lane")
+            or self._resolve_lane_key(detector_record)
+        )
+        tls_id = mapped.get("tls_id")
+        groups = mapped.get("groups")
+        if groups is None:
+            groups = mapped.get("phase_pos")
+        if groups is not None and not isinstance(groups, (list, tuple, set)):
+            groups = [groups]
+        if groups is not None:
+            try:
+                groups = [int(g) for g in groups]
+            except Exception:
+                groups = None
+        return det_id, lane_id, tls_id, groups
+
+    def _lane_vehicle_map_at_time(self, t, lane_id, allow_edge_fallback=True):
+        """
+        Return vehicle->position map for a lane at time `t`.
+        Falls back to merging same-edge keys when exact lane keys are absent.
+        """
+        lane_dict = getattr(self, "timestep_lane_positions", {}).get(t, {})
+        vehs = lane_dict.get(lane_id)
+        if vehs is not None:
+            return vehs
+        if not allow_edge_fallback or not lane_id:
+            return {}
+
+        import re
+        m = re.match(r"(.+)_\d+$", str(lane_id))
+        edge_id = m.group(1) if m else str(lane_id)
+        merged = {}
+        for key, vmap in lane_dict.items():
+            mk = re.match(r"(.+)_\d+$", str(key))
+            key_edge = mk.group(1) if mk else str(key)
+            if key_edge == edge_id:
+                for vid, pos in vmap.items():
+                    merged[vid] = pos
+        return merged
+
+    def _detector_intersection_id(self, det_id, tls_id=None):
+        """
+        Return a stable intersection identifier for a detector.
+        Prefers tls_id (e.g. 'Canal', 'Clinton') over detector-prefix
+        so that queue / throughput / delay all use the same ID scheme.
+        """
+        if tls_id:
+            return str(tls_id)
+        det_id = str(det_id or "")
+        if det_id and "_" in det_id:
+            return det_id.split("_", 1)[0]
+        return det_id or "unknown"
+
+    def _lane_edge_id(self, lane_id):
+        m = re.match(r"(.+)_\d+$", str(lane_id or ""))
+        return m.group(1) if m else str(lane_id or "")
+
+    def _edge_direction_labels_from_net(self):
+        """
+        Infer EB/WB/NB/SB labels from edge geometry in net.xml.
+        """
+        out = {}
+        net_xml_path = getattr(self, "net_file", None)
+        if not net_xml_path or not os.path.isfile(net_xml_path):
+            return out
+
+        try:
+            tree = ET.parse(net_xml_path)
+            root = tree.getroot()
+        except Exception:
+            return out
+
+        def _dir_from_shape(shape_text):
+            if not shape_text:
+                return None, None
+            pts = []
+            for token in str(shape_text).strip().split():
+                try:
+                    x_str, y_str = token.split(",")
+                    pts.append((float(x_str), float(y_str)))
+                except Exception:
+                    continue
+            if len(pts) < 2:
+                return None, None
+            x0, y0 = pts[0]
+            x1, y1 = pts[-1]
+            dx = x1 - x0
+            dy = y1 - y0
+            if abs(dx) >= abs(dy):
+                return ("EB", "eastbound") if dx >= 0 else ("WB", "westbound")
+            return ("NB", "northbound") if dy >= 0 else ("SB", "southbound")
+
+        for edge in root.findall(".//edge"):
+            edge_id = edge.attrib.get("id")
+            if not edge_id or edge_id.startswith(":"):
+                continue
+            shape_text = edge.attrib.get("shape")
+            if not shape_text:
+                lane = edge.find("./lane")
+                if lane is not None:
+                    shape_text = lane.attrib.get("shape")
+            short_label, long_label = _dir_from_shape(shape_text)
+            if short_label:
+                out[edge_id] = {
+                    "direction_short": short_label,
+                    "direction_long": long_label,
+                }
+        return out
+
+    def _infer_cycle_length_from_intervals(self, tls_id):
+        """
+        Infer fixed cycle length from repeated TLS interval states when no static
+        tlLogic program is available.
+        """
+        intervals = (getattr(self, "tls_intervals", {}) or {}).get(tls_id, [])
+        if not intervals or len(intervals) < 4:
+            return None
+
+        first_state = intervals[0][2]
+        first_dur = float(intervals[0][1] - intervals[0][0])
+        starts = []
+        for a, b, s in intervals:
+            dur = float(b - a)
+            if s == first_state and abs(dur - first_dur) <= 1e-6:
+                starts.append(float(a))
+
+        if len(starts) >= 2:
+            diffs = [starts[i + 1] - starts[i] for i in range(len(starts) - 1) if starts[i + 1] > starts[i]]
+            if diffs:
+                return float(np.median(diffs))
+
+        # Fallback: use repeated state string regardless of first duration.
+        state_starts = defaultdict(list)
+        for a, _, s in intervals:
+            state_starts[str(s)].append(float(a))
+        candidate_diffs = []
+        for starts in state_starts.values():
+            if len(starts) >= 2:
+                candidate_diffs.extend(
+                    starts[i + 1] - starts[i] for i in range(len(starts) - 1) if starts[i + 1] > starts[i]
+                )
+        if candidate_diffs:
+            return float(np.median(candidate_diffs))
+        return None
 
     def _debug_city_signal_requirements(self):
         """Print why the dataset is treated as non‑urban‑signal and summarize data scale."""
@@ -1970,10 +2384,11 @@ class TrafficMetrics:
         greens, is_static, cycle_len, chosen_tls = self._get_green_windows(tls_id=None)
         has_tls_green = len(greens) > 0
 
-        print("[Urban Signals][DEBUG] detector_data: ", "OK" if has_det else "MISSING/EMPTY",
-            f"(intervals={det_count})")
-        print("[Urban Signals][DEBUG] tls green windows: ", "OK" if has_tls_green else "MISSING",
-            f"(tls_id={chosen_tls}, n_greens={len(greens)}, is_static={is_static}, cycle_len={cycle_len})")
+        if _VERBOSE:
+            print("[Urban Signals][DEBUG] detector_data: ", "OK" if has_det else "MISSING/EMPTY",
+                f"(intervals={det_count})")
+            print("[Urban Signals][DEBUG] tls green windows: ", "OK" if has_tls_green else "MISSING",
+                f"(tls_id={chosen_tls}, n_greens={len(greens)}, is_static={is_static}, cycle_len={cycle_len})")
 
         return has_det, has_tls_green
     
@@ -2004,35 +2419,17 @@ class TrafficMetrics:
 
     def _run_city_signal_metrics_if_applicable(self, allow_partial=True):
         """
-        Only compute the following metrics when the dataset qualifies as an “urban signal” case:
-        - PAoG / GOR / Approach Delay (intersection approach metric) / Spillback / TTS
-          (+ CAV/HDV splits with backfilled dashboard keys)
+        Only compute the following metrics when the dataset qualifies as an urban signal case:
+        - Spillback / Throughput / Average Delay / Queue Length / v/c Ratio
 
         If not qualified, print the reason. With `allow_partial=True`, run partial metrics that
-        require only detector data (e.g., spillback), even without TLS.
+        require only detector data (e.g., spillback, throughput), even without TLS.
         """
         has_det, has_tls_green = self._debug_city_signal_requirements()
 
         if has_det and has_tls_green:
-            print("[Urban Signals] Detector + TLS detected. Computing PAOG / GOR / ApproachDelay / Spillback / TTS ...")
-
-            # --- PAOG ---
-            try:
-                self.compute_paog()
-            except Exception as e:
-                print(f"[Urban Signals][WARN] compute_paog failed: {e}")
-
-            # --- GOR (overall) ---
-            try:
-                self.compute_gor()
-            except Exception as e:
-                print(f"[Urban Signals][WARN] compute_gor failed: {e}")
-
-            # --- Approach Delay (intersection approach metric) ---
-            try:
-                self.compute_approach_delay(free_flow_speed_hdv=13.0, free_flow_speed_cav=15.0)
-            except Exception as e:
-                print(f"[Urban Signals][WARN] compute_approach_delay failed: {e}")
+            if _VERBOSE:
+                print("[Urban Signals] Detector + TLS detected. Computing Throughput / AvgDelay / QueueLength / v/c / Spillback ...")
 
             # --- Spillback ---
             try:
@@ -2040,63 +2437,31 @@ class TrafficMetrics:
             except Exception as e:
                 print(f"[Urban Signals][WARN] compute_queue_spillback failed: {e}")
 
-            # --- TTS (overall) ---
+            # --- Throughput ---
             try:
-                self.compute_time_to_service()
+                self.compute_throughput()
             except Exception as e:
-                print(f"[Urban Signals][WARN] compute_time_to_service failed: {e}")
+                print(f"[Urban Signals][WARN] compute_throughput failed: {e}")
 
-            # ========== NEW: by‑type versions and dashboard backfilling ==========
-            # GOR by type
+            # --- Average Delay (intersection-level) ---
             try:
-                if hasattr(self, "compute_gor"):
-                    self.compute_gor(tls_id=None, debug=False)
-
-                    # Backfill by-type results into common keys for dashboards
-                    if not hasattr(self, "gor_values") or not isinstance(self.gor_values, dict):
-                        self.gor_values = {}
-                    by_type = {}
-                    if hasattr(self, "gor_type") and isinstance(self.gor_type, dict):
-                        by_type = {
-                            "cav": self.gor_type.get("cav"),
-                            "hdv": self.gor_type.get("hdv"),
-                            "all": self.gor_type.get("all"),
-                        }
-                    self.gor_values["by_type"] = by_type
-                    if by_type:
-                        self.gor_values["cav"] = by_type.get("cav")
-                        self.gor_values["hdv"] = by_type.get("hdv")
-                else:
-                    print("[Urban Signals][INFO] compute_gor_by_type_fcd not found; skipping by-type GOR.")
+                self.compute_average_delay()
             except Exception as e:
-                print(f"[Urban Signals][WARN] compute_gor_by_type_fcd failed: {e}")
+                print(f"[Urban Signals][WARN] compute_average_delay failed: {e}")
 
-            # TTS by type
+            # --- Queue Length ---
             try:
-                if hasattr(self, "compute_time_to_service"):
-                    self.compute_time_to_service(tls_id=None, debug=False)
-
-                    if not hasattr(self, "time_to_service_values") or not isinstance(self.time_to_service_values, dict):
-                        self.time_to_service_values = {}
-                    if hasattr(self, "time_to_service_split") and isinstance(self.time_to_service_split, dict):
-                        self.time_to_service_values["by_type"] = {
-                            "cav": self.time_to_service_split.get("cav"),
-                            "hdv": self.time_to_service_split.get("hdv"),
-                            "all": self.time_to_service_split.get("all"),
-                        }
-                else:
-                    print("[Urban Signals][INFO] compute_time_to_service not found; skipping by-type TTS.")
+                self.compute_queue_length()
             except Exception as e:
-                print(f"[Urban Signals][WARN] compute_time_to_service failed: {e}")
+                import traceback
+                print(f"[Urban Signals][WARN] compute_queue_length failed: {e}")
+                traceback.print_exc()
 
+            # --- v/c Ratio ---
             try:
-                print("[PIPELINE] GOR(all) =", self.gor_values.get("all") if hasattr(self, "gor_values") else None)
-                print("[PIPELINE] GOR(by_type) =", self.gor_values.get("by_type") if hasattr(self, "gor_values") else None)
-                print("[PIPELINE] TTS(all) =", getattr(self, "time_to_service_values", None))
-                print("[PIPELINE] TTS(by_type) =", (self.time_to_service_values.get("by_type")
-                                                if isinstance(getattr(self, "time_to_service_values", None), dict) else None))
+                self.compute_vc_ratio()
             except Exception as e:
-                print(f"[PIPELINE][WARN] print summary failed: {e}")
+                print(f"[Urban Signals][WARN] compute_vc_ratio failed: {e}")
 
         else:
             if not has_det and not has_tls_green:
@@ -2107,14 +2472,18 @@ class TrafficMetrics:
                 print("[Urban Signals] No TLS green windows detected. Skipping city-signal metrics.")
 
             if allow_partial and has_det and not has_tls_green:
-                print("[Urban Signals] Running partial metrics that only need Detector: Spillback.")
+                print("[Urban Signals] Running partial metrics (Spillback, Throughput).")
                 try:
                     self.compute_queue_spillback()
                 except Exception as e:
                     print(f"[Urban Signals][WARN] partial compute_queue_spillback failed: {e}")
+                try:
+                    self.compute_throughput()
+                except Exception as e:
+                    print(f"[Urban Signals][WARN] partial compute_throughput failed: {e}")
    
     # ------------------------------
-    # 1. PAOG (Percent Arrivals On Green)
+    # Detector / TLS Mapping Helpers
     # =========================
     def parse_add_detectors_to_map(self, add_xml_path):
         """
@@ -2142,7 +2511,8 @@ class TrafficMetrics:
             if did and lane and did not in det2lane:
                 det2lane[did] = lane
 
-        print(f"[Mapping] det2lane loaded: {len(det2lane)} pairs")
+        if _VERBOSE:
+            print(f"[Mapping] det2lane loaded: {len(det2lane)} pairs")
         return det2lane
     
     def load_lane_tls_mapping_json(self, json_path):
@@ -2170,8 +2540,131 @@ class TrafficMetrics:
             if groups is None:
                 groups = val.get("phase_pos")  # backward‑compat field
             lane_map[lane_id] = {"tls_id": tls_id, "groups": groups}
-        print(f"[Mapping] lane->TLS loaded: {len(lane_map)} lanes")
+        if _VERBOSE:
+            print(f"[Mapping] lane->TLS loaded: {len(lane_map)} lanes")
         return lane_map
+
+    def build_lane_tls_mapping_from_net(self, net_xml_path):
+        """
+        Build lane -> {tls_id, groups} mapping directly from SUMO net.xml.
+
+        Each controlled connection contributes its incoming lane
+        `<from>_<fromLane>` and the associated `linkIndex` group.
+        """
+        lane_map = {}
+        if not net_xml_path or not os.path.isfile(net_xml_path):
+            print(f"[Mapping] WARN: net.xml not found for auto lane->TLS mapping: {net_xml_path}")
+            return lane_map
+
+        tree = ET.parse(net_xml_path)
+        root = tree.getroot()
+
+        ambiguous = 0
+        for conn in root.findall(".//connection"):
+            tls_id = conn.attrib.get("tl")
+            link_index = conn.attrib.get("linkIndex")
+            from_edge = conn.attrib.get("from")
+            from_lane = conn.attrib.get("fromLane")
+
+            if not tls_id or link_index is None or from_edge is None or from_lane is None:
+                continue
+
+            try:
+                group_idx = int(link_index)
+            except Exception:
+                continue
+
+            lane_id = f"{from_edge}_{from_lane}"
+            rec = lane_map.setdefault(lane_id, {"tls_id": tls_id, "groups": []})
+            if rec["tls_id"] != tls_id:
+                ambiguous += 1
+                continue
+            if group_idx not in rec["groups"]:
+                rec["groups"].append(group_idx)
+
+        for rec in lane_map.values():
+            rec["groups"].sort()
+
+        if _VERBOSE:
+            print(
+                f"[Mapping] lane->TLS auto-built from net: {len(lane_map)} lanes"
+                + (f" (ambiguous={ambiguous})" if ambiguous else "")
+            )
+        return lane_map
+
+    def build_detector_mapping_from_net(self, det2lane, net_xml_path):
+        """
+        Build detector -> {sumo_lane, tls_id, groups} mapping from detector ids,
+        lane ids, and SUMO net.xml controlled connections.
+
+        When detector ids contain movement hints such as `_left`, `_right`, or
+        `_straight`, prefer connection groups whose SUMO `dir` matches that hint.
+        """
+        out = {}
+        if not det2lane:
+            return out
+        if not net_xml_path or not os.path.isfile(net_xml_path):
+            print(f"[Mapping] WARN: net.xml not found for auto detector mapping: {net_xml_path}")
+            return self._compose_detector_mapping(det2lane, {})
+
+        tree = ET.parse(net_xml_path)
+        root = tree.getroot()
+        lane_conns = defaultdict(list)
+        for conn in root.findall(".//connection"):
+            tls_id = conn.attrib.get("tl")
+            link_index = conn.attrib.get("linkIndex")
+            from_edge = conn.attrib.get("from")
+            from_lane = conn.attrib.get("fromLane")
+            direction = conn.attrib.get("dir")
+
+            if not tls_id or link_index is None or from_edge is None or from_lane is None:
+                continue
+
+            try:
+                group_idx = int(link_index)
+            except Exception:
+                continue
+
+            lane_id = f"{from_edge}_{from_lane}"
+            lane_conns[lane_id].append({
+                "tls_id": tls_id,
+                "group": group_idx,
+                "dir": direction,
+            })
+
+        def desired_dirs(det_id: str):
+            det_id = (det_id or "").lower()
+            if "_left" in det_id:
+                return {"l", "L"}
+            if "_right" in det_id:
+                return {"r", "R"}
+            if "_straight" in det_id:
+                return {"s"}
+            return set()
+
+        n_matched = 0
+        for det_id, lane_id in det2lane.items():
+            conns = lane_conns.get(lane_id, [])
+            wanted = desired_dirs(det_id)
+
+            selected = [c for c in conns if c.get("dir") in wanted] if wanted else list(conns)
+            if not selected:
+                selected = list(conns)
+
+            tls_id = selected[0]["tls_id"] if selected else None
+            groups = sorted({c["group"] for c in selected if c["tls_id"] == tls_id}) if tls_id else None
+            if selected:
+                n_matched += 1
+
+            out[det_id] = {
+                "sumo_lane": lane_id,
+                "tls_id": tls_id,
+                "groups": groups,
+            }
+
+        if _VERBOSE:
+            print(f"[Mapping] detector->TLS auto-built from net: {len(out)} dets (matched={n_matched})")
+        return out
 
     def debug_list_fcd_lane_keys(self, sample_times=5, max_keys=50):
         """
@@ -2297,272 +2790,48 @@ class TrafficMetrics:
             else:
                 n_miss += 1
             out[det_id] = rec
-        print(f"[Mapping] composed: {len(out)} dets (tls-linked={n_ok}, no-tls={n_miss})")
+        if _VERBOSE:
+            print(f"[Mapping] composed: {len(out)} dets (tls-linked={n_ok}, no-tls={n_miss})")
         return out
 
- 
-    def compute_paog(
-        self,
-        pre_stop_window=8.0,
-        stop_speed_thresh=0.5,
-        detector_mapping=None,
-        dt_tolerance=1e-6,
-        count_yellow_as_green=False,
-        debug=True,
-        debug_samples_per_lane=2,
-        allow_edge_fallback=True,
-    ):
-        """
-        Compute PAoG (Percent of Arrivals on Green) per detector interval using FCD + TLS + mapping.
 
-        Main idea
-        ---------
-        1) For each detector interval, find each vehicle's first‑appearance time on the mapped SUMO lane_id.
-        2) If TLS series + mapping exist, classify arrival as on‑green if required signal groups are green
-           at t_arr (optionally count 'y' as green).
-        3) Otherwise fallback to a brief speed/stop heuristic.
-        4) If the exact FCD lane key is not found, optionally fall back to an *edge‑level* merge
-           (e.g., use all FCD keys whose "edge part" equals the mapped lane's edge).
-
-        Returns
-        -------
-        dict: detector_id -> list[dict]
-            Each dict includes: begin, end, paog, n_total, n_cav, n_hdv, paog_cav, paog_hdv, n_detected
-        """
-        import bisect, re
-
-        # ---- resolve mapping param ----
-        if detector_mapping is None and hasattr(self, "detector_mapping"):
-            detector_mapping = self.detector_mapping
-        have_mapping = isinstance(detector_mapping, dict) and len(detector_mapping) > 0
-
-        # ---- prechecks ----
-        if not hasattr(self, "timesteps") or not hasattr(self, "timestep_lane_positions"):
-            print("[PAoG] ERROR: FCD timesteps / lane grid missing.")
-            self.paog_by_detector = {}
-            return {}
-        if not getattr(self, "detector_data", None):
-            print("[PAoG] ERROR: detector_data missing/empty.")
-            self.paog_by_detector = {}
-            return {}
-
-        times = list(self.timesteps)
-        if not times:
-            print("[PAoG] ERROR: empty FCD time axis.")
-            self.paog_by_detector = {}
-            return {}
-        tmin, tmax = times[0], times[-1]
-        time_to_idx = {t: i for i, t in enumerate(times)}
-
-        have_tls_series = bool(getattr(self, "tls_time_states", None))
-        can_use_tls = have_tls_series and have_mapping
-
-        # ---- tiny helpers ----
-        def is_cav(veh_id: str) -> bool:
-            return "_cav" in (veh_id or "").lower()
-
-        _tls_axes = {}
-        def tls_state_at(tls_id, series, t_query):
-            # series: [(t, state_str), ...]
-            if tls_id not in _tls_axes:
-                _tls_axes[tls_id] = [tt for tt, _ in series]
-            axis = _tls_axes[tls_id]
-            j = bisect.bisect_right(axis, t_query) - 1
-            return None if j < 0 else series[j][1]
-
-        green_set = {'g', 'G'}
-        if count_yellow_as_green:
-            green_set |= {'y', 'Y'}
-
-        def on_green(state_str, groups):
-            if state_str is None:
-                return False
-            s = state_str
-            if not groups:
-                return any(ch in green_set for ch in s)
-            for gi in groups:
-                if gi < 0 or gi >= len(s): return False
-                if s[gi] not in green_set: return False
-            return True
-
-        # Extract the “edge part” by stripping the trailing "_<laneIndex>"
-        # e.g., "277219207#0_2" -> "277219207#0"
-        lane_idx_pat = re.compile(r"(.+)_\d+$")
-        def edge_part(lane_id: str) -> str:
-            m = lane_idx_pat.match(lane_id or "")
-            return m.group(1) if m else (lane_id or "")
-
-        # ---- DEBUG: show how FCD lanes are keyed ----
-        if debug:
-            # collect a sample of FCD keys from first few timesteps
-            fcd_keys_sample = set()
-            for t in times[:min(len(times), 30)]:  # up to the first ~3s if dt=0.1
-                ln = self.timestep_lane_positions.get(t, {})
-                fcd_keys_sample.update(ln.keys())
-                if len(fcd_keys_sample) >= 50:
-                    break
-            sample_show = sorted(list(fcd_keys_sample))[:20]
-            # print(f"[PAoG/DEBUG] FCD keys sample (first timesteps): {sample_show}")
-            # quick check: do we see lane-indexed keys (ending with _d)?
-            has_lane_index = any(lane_idx_pat.match(k) for k in fcd_keys_sample)
-            print(f"[PAoG/DEBUG] FCD lane style: {'lane-indexed' if has_lane_index else 'edge-level or mixed'}")
-
-            # mapping status
-            print(f"[PAoG/DEBUG] mapping(detector->lane/tls) size={len(detector_mapping) if have_mapping else 0}")
-            print(f"[PAoG/DEBUG] FCD window=[{tmin}..{tmax}] dt≈{(times[1]-times[0]) if len(times)>1 else 'NA'}")
-            tls_ids = list(self.tls_time_states.keys()) if have_tls_series else []
-            print(f"[PAoG/DEBUG] TLS time-series: {have_tls_series} (n={len(tls_ids)})")
-
-        # ---- iterate detector intervals with time clamping ----
-        results = {}
-        lane_dbg_count = {}
-        skipped_no_overlap = 0
-        clamped_intervals = 0
-
-        for d in self.detector_data:
-            det_id = d.get("id") or d.get("detector_id") or d.get("lane")
-            if not det_id:
-                if debug: print("[PAoG/DEBUG] skip(detector without id):", d)
-                continue
-
-            begin = float(d["begin"]); end = float(d["end"])
-            if end < tmin or begin > tmax:
-                skipped_no_overlap += 1
-                continue
-            c_begin, c_end = max(begin, tmin), min(end, tmax)
-            if (c_begin != begin) or (c_end != end):
-                clamped_intervals += 1
-
-            # mapping lookup
-            mapped = detector_mapping.get(det_id, {}) if have_mapping else {}
-            lane_id = mapped.get("sumo_lane") or mapped.get("lane_id") or d.get("lane_id") or d.get("sumo_lane")
-            tls_id  = mapped.get("tls_id")
-            groups  = mapped.get("groups") or mapped.get("phase_pos")
-
-            if debug:
-                cnt = lane_dbg_count.get(det_id, 0)
-                if cnt < 1:
-                    # print a one‑time mapping line if needed
-                    lane_dbg_count[det_id] = cnt + 1
-
-            # collect first‑appearance times on this lane (with lane/edge fallback)
-            seen_first = {}
-            i0 = bisect.bisect_left(times, c_begin - 1e-9)
-            i1 = bisect.bisect_right(times, c_end   + 1e-9)
-
-            epart = edge_part(lane_id or "")
-            used_edge_fallback_once = False
-
-            for ti in range(i0, i1):
-                t = times[ti]
-                lane_dict = self.timestep_lane_positions.get(t, {})
-                veh_pos_map = lane_dict.get(lane_id, None)
-
-                # fallback: merge all FCD keys whose edge_part equals lane_id's edge
-                if veh_pos_map is None and allow_edge_fallback and epart:
-                    merged = {}
-                    for k, vmap in lane_dict.items():
-                        if edge_part(k) == epart:
-                            for vid, pos in vmap.items():
-                                merged[vid] = pos
-                    if merged:
-                        veh_pos_map = merged
-                        used_edge_fallback_once = True
-
-                if not veh_pos_map:
-                    continue
-
-                for vid in veh_pos_map.keys():
-                    if vid not in seen_first:
-                        seen_first[vid] = t
-
-            n_total = len(seen_first)
-            if n_total == 0:
-                results.setdefault(det_id, []).append({
-                    "begin": c_begin, "end": c_end, "paog": None,
-                    "n_total": 0, "n_cav": 0, "n_hdv": 0,
-                    "paog_cav": None, "paog_hdv": None,
-                    "n_detected": d.get("nVeh", None),
-                })
-                continue
-
-            # Counters
-            cav_total = hdv_total = 0
-            cav_green = hdv_green = 0
-            series = self.tls_time_states.get(tls_id) if (can_use_tls and tls_id) else None
-
-            for vid, t_arr in seen_first.items():
-                if series is not None:
-                    st = tls_state_at(tls_id, series, t_arr)
-                    ok = on_green(st, groups)
-                else:
-                    # fallback speed/stop heuristic
-                    idx = time_to_idx.get(t_arr, None)
-                    if idx is None or idx == 0:
-                        speed_est = 1.0
-                    else:
-                        pos_t = self.timestep_lane_positions.get(t_arr, {}).get(lane_id, {}).get(vid)
-                        t_prev = times[idx - 1]
-                        pos_prev = self.timestep_lane_positions.get(t_prev, {}).get(lane_id, {}).get(vid)
-                        if pos_t is None or pos_prev is None:
-                            speed_est = 1.0
-                        else:
-                            dtp = max(1e-6, (t_arr - t_prev))
-                            speed_est = (pos_t - pos_prev) / dtp
-
-                    stopped_recently = False
-                    t_start = t_arr - pre_stop_window
-                    j0 = bisect.bisect_left(times, t_start - 1e-9)
-                    j1 = idx if idx is not None else j0
-                    for j in range(j0, j1 + 1):
-                        tt = times[j]
-                        pos_j = self.timestep_lane_positions.get(tt, {}).get(lane_id, {}).get(vid)
-                        if j > 0:
-                            tt_prev = times[j - 1]
-                            pos_j_prev = self.timestep_lane_positions.get(tt_prev, {}).get(lane_id, {}).get(vid)
-                        else:
-                            pos_j_prev = None
-                        if pos_j is not None and pos_j_prev is not None:
-                            dtj = tt - times[j - 1]
-                            vj = (pos_j - pos_j_prev) / max(1e-6, dtj)
-                            if vj <= stop_speed_thresh:
-                                stopped_recently = True
-                                break
-                    ok = (not stopped_recently) and (speed_est is None or speed_est > stop_speed_thresh)
-
-                if is_cav(vid):
-                    cav_total += 1
-                    if ok: cav_green += 1
-                else:
-                    hdv_total += 1
-                    if ok: hdv_green += 1
-
-            paog_all = (cav_green + hdv_green) / n_total if n_total > 0 else None
-            paog_cav = (cav_green / cav_total) if cav_total > 0 else None
-            paog_hdv = (hdv_green / hdv_total) if hdv_total > 0 else None
-
-            results.setdefault(det_id, []).append({
-                "begin": c_begin, "end": c_end,
-                "paog": paog_all,
-                "n_total": n_total,
-                "n_cav": cav_total, "n_hdv": hdv_total,
-                "paog_cav": paog_cav, "paog_hdv": paog_hdv,
-                "n_detected": d.get("nVeh", None),
-            })
-
-        if debug:
-            print(f"[PAoG/DEBUG] Summary: skipped_no_overlap={skipped_no_overlap}, "
-                f"clamped_intervals={clamped_intervals}, detectors={len(results)}")
-
-        self.paog_by_detector = results
-        return results
-
-    # 2. GOR (Green Occupancy Ratio)
+    # ------------------------------
+    # Urban Macro Metrics
     # =========================
+
+    def _get_lane_intersection_map(self):
+        """
+        Map approach lane_id -> intersection_id (tls_id).
+
+        Uses tls_id from detector_mapping as intersection_id.
+        Falls back to 'unknown' when TLS info is unavailable.
+        """
+        lane_to_int = {}
+        detector_mapping = getattr(self, "detector_mapping", None)
+        if isinstance(detector_mapping, dict) and detector_mapping:
+            for mp in detector_mapping.values():
+                lane_id = mp.get("sumo_lane") or mp.get("lane_id")
+                tls_id = mp.get("tls_id")
+                if lane_id:
+                    lane_to_int[lane_id] = tls_id or "unknown"
+        elif hasattr(self, "det2lane") and isinstance(self.det2lane, dict):
+            lane_map = getattr(self, "lane_map", None)
+            for v in self.det2lane.values():
+                if v:
+                    if isinstance(lane_map, dict) and v in lane_map:
+                        lane_to_int[v] = lane_map[v].get("tls_id") or "unknown"
+                    else:
+                        lane_to_int[v] = "unknown"
+        else:
+            for d in getattr(self, "detector_data", []):
+                lane_id = self._resolve_lane_key(d)
+                if lane_id:
+                    lane_to_int.setdefault(lane_id, "unknown")
+        return lane_to_int
 
     def _resolve_lane_key(self, d):
         """
-        Safely parse the “lane” field in a detector interval record into a SUMO lane key.
+        Safely parse the "lane" field in a detector interval record into a SUMO lane key.
 
         Rules
         -----
@@ -2575,142 +2844,141 @@ class TrafficMetrics:
             return self.det2lane.get(ln, ln)
         return ln
 
-    def compute_gor(self, tls_id=None, detector_filter=None, count_yellow_as_green=False, clip=True, debug=False):
+    # ------------------------------
+    # Approach Delay — per approach lane / intersection, time-windowed
+    # ------------------------------
+    def compute_approach_delay(self, free_flow_speed_hdv=13.0, free_flow_speed_cav=15.0,
+                               window_s=300.0):
         """
-        Compute type‑split Green Occupancy using FCD presence during green windows.
+        Compute approach delay per approach lane, grouped by intersection.
 
-        For each detector interval overlapping a green window, sample timesteps and check
-        if any CAV/HDV are present on that lane; accumulate presence time and divide by
-        total green time.
+        Each detector-mapped approach lane is treated as a separate approach.
+        Delay = actual traversal time - free-flow time (type-specific ff speed).
 
-        Produces
-        --------
-        self.gor_type = {
-            "all_green_time": total_green_time_considered,
-            "cav": gor_cav,   # in [0,1] or None
-            "hdv": gor_hdv,   # in [0,1] or None
-        }
-
-        Note
+        Sets
         ----
-        This does NOT use detector 'occ' directly (which is not type‑split);
-        it uses FCD lane occupancy instead.
+        self.approach_delay_values = {
+            "timeseries": list[dict],   # per intersection per window
+            "summary": dict,            # per intersection aggregates
+            # Global backward-compatible:
+            "hdv": float, "cav": float,
+        }
         """
-        # Preconditions
-        if not getattr(self, "detector_data", None):
-            print("[GOR-byType] Detector data not available.")
-            self.gor_type = {"all_green_time": 0.0, "cav": None, "hdv": None}
+        _empty = {"timeseries": [], "summary": {}, "hdv": 0.0, "cav": 0.0}
+        self.approach_delay_values = _empty
+
+        lane_int_map = self._get_lane_intersection_map()
+        approach_lanes = set(lane_int_map.keys())
+
+        if not approach_lanes or not getattr(self, "timesteps", None):
+            print("Average approach delay - HDV: 0.00s, CAV: 0.00s")
             return
-
-        if not (hasattr(self, "timesteps") and hasattr(self, "timestep_lane_positions")):
-            print("[GOR-byType] FCD grids not available.")
-            self.gor_type = {"all_green_time": 0.0, "cav": None, "hdv": None}
-            return
-
-        green_windows, _, _, chosen_tls = self._get_green_windows(tls_id)
-        if not green_windows:
-            print("[GOR-byType] No TLS green windows available.")
-            self.gor_type = {"all_green_time": 0.0, "cav": None, "hdv": None}
-            return
-
-        # Optional lane filtering (use the 'lane' carried in detector_data)
-        allowed = set(detector_filter) if detector_filter else None
-
-        # Helper: CAV / HDV classifier from vehicle id
-        def is_cav(veh_id: str) -> bool:
-            return "_cav" in (veh_id or "").lower()
 
         times = list(self.timesteps)
-        if len(times) < 2:
-            print("[GOR-byType] FCD timesteps insufficient.")
-            self.gor_type = {"all_green_time": 0.0, "cav": None, "hdv": None}
-            return
+        t_min = times[0] if times else 0.0
+        t_max = times[-1] if times else 0.0
 
-        import bisect
-        dt = times[1] - times[0]
-
-        cav_time = 0.0
-        hdv_time = 0.0
-        green_time_total = 0.0
-
-        for d in self.detector_data:
-            lane = self._resolve_lane_key(d)
-            if allowed is not None and lane not in allowed:
-                continue
-
-            int_s = float(d["begin"]); int_e = float(d["end"])
-            if int_e <= int_s:
-                continue
-
-            # Intersect detector interval with each green window
-            for gs, ge in green_windows:
-                s = max(int_s, gs); e = min(int_e, ge)
-                if s >= e:
+        # Track traversals with approach (lane) and intersection context
+        traversals = {}  # (lane_id, veh_id) -> {t0, p0, t1, p1, vtype, int_id}
+        for t in self.timesteps:
+            lane_dict = self.timestep_lane_positions.get(t, {})
+            for lane_id in approach_lanes:
+                vehs = lane_dict.get(lane_id)
+                if vehs is None:
+                    vehs = self._lane_vehicle_map_at_time(t, lane_id, allow_edge_fallback=True)
+                if not vehs:
                     continue
-
-                # Integrate on discrete FCD timesteps
-                i0 = bisect.bisect_left(times, s - 1e-9)
-                i1 = bisect.bisect_left(times, e - 1e-9)  # half‑open on the right
-                if i1 <= i0:
-                    continue
-
-                for i in range(i0, i1):
-                    t = times[i]
-                    lane_dict = self.timestep_lane_positions.get(t, {})
-                    vehs = lane_dict.get(lane, {})
-                    if not vehs:
-                        # no vehicles this sample; contribute only to denominator
-                        green_time_total += dt
+                int_id = lane_int_map.get(lane_id, "unknown")
+                for veh_id, pos in vehs.items():
+                    v_type = self.vehicle_info.get(veh_id, {}).get("type")
+                    if v_type not in ("hdv", "cav"):
                         continue
-                    has_cav = any(is_cav(vid) for vid in vehs.keys())
-                    has_hdv = any((not is_cav(vid)) for vid in vehs.keys())
-                    if has_cav: cav_time += dt
-                    if has_hdv: hdv_time += dt
-                    green_time_total += dt
+                    key = (lane_id, veh_id)
+                    rec = traversals.get(key)
+                    if rec is None:
+                        traversals[key] = {
+                            "t0": float(t), "p0": float(pos),
+                            "t1": float(t), "p1": float(pos),
+                            "vtype": v_type, "int_id": int_id,
+                            "lane_id": lane_id,
+                        }
+                    else:
+                        rec["t1"] = float(t)
+                        rec["p1"] = float(pos)
 
-        gor_cav = (cav_time / green_time_total) if green_time_total > 0 else None
-        gor_hdv = (hdv_time / green_time_total) if green_time_total > 0 else None
+        # Compute delay per traversal, assign to window
+        windows = _build_time_windows(t_min, t_max, window_s)
+        if not windows:
+            windows = [(t_min, t_max)]
 
-        if clip:
-            if gor_cav is not None:
-                gor_cav = max(0.0, min(1.0, gor_cav))
-            if gor_hdv is not None:
-                gor_hdv = max(0.0, min(1.0, gor_hdv))
+        min_distance_m = 10.0
+        win_data = defaultdict(lambda: {"delays_cav": [], "delays_hdv": []})
+        global_delays = {"cav": [], "hdv": []}
 
-        self.gor_type = {
-            "all_green_time": green_time_total,
-            "cav": gor_cav,
-            "hdv": gor_hdv
+        for rec in traversals.values():
+            travel_time = max(0.0, rec["t1"] - rec["t0"])
+            dist = max(0.0, rec["p1"] - rec["p0"])
+            if dist < min_distance_m or travel_time <= 0.0:
+                continue
+            v_ff = free_flow_speed_hdv if rec["vtype"] == "hdv" else free_flow_speed_cav
+            ff_time = dist / max(v_ff, 0.1)
+            delay = max(0.0, travel_time - ff_time)
+
+            w_idx = min(int((rec["t1"] - t_min) / window_s), len(windows) - 1) if window_s > 0 else 0
+            win_data[(rec["int_id"], w_idx)][f"delays_{rec['vtype']}"].append(delay)
+            global_delays[rec["vtype"]].append(delay)
+
+        # Build timeseries
+        timeseries = []
+        for (int_id, w_idx), wd in sorted(win_data.items()):
+            ws, we = windows[min(w_idx, len(windows) - 1)]
+            all_d = wd["delays_cav"] + wd["delays_hdv"]
+            timeseries.append({
+                "intersection_id": int_id,
+                "window_start": ws,
+                "window_end": we,
+                "approach_delay_all": float(np.mean(all_d)) if all_d else 0.0,
+                "approach_delay_cav": float(np.mean(wd["delays_cav"])) if wd["delays_cav"] else 0.0,
+                "approach_delay_hdv": float(np.mean(wd["delays_hdv"])) if wd["delays_hdv"] else 0.0,
+                "n_all": len(all_d),
+                "n_cav": len(wd["delays_cav"]),
+                "n_hdv": len(wd["delays_hdv"]),
+            })
+
+        # Per-intersection summary
+        int_s = defaultdict(lambda: {"d_cav": [], "d_hdv": []})
+        for row in timeseries:
+            s = int_s[row["intersection_id"]]
+            if row["n_cav"] > 0:
+                s["d_cav"].append(row["approach_delay_cav"])
+            if row["n_hdv"] > 0:
+                s["d_hdv"].append(row["approach_delay_hdv"])
+
+        summary = {}
+        for int_id, s in int_s.items():
+            all_d = s["d_cav"] + s["d_hdv"]
+            summary[int_id] = {
+                "intersection_id": int_id,
+                "approach_delay_all": float(np.mean(all_d)) if all_d else 0.0,
+                "approach_delay_cav": float(np.mean(s["d_cav"])) if s["d_cav"] else 0.0,
+                "approach_delay_hdv": float(np.mean(s["d_hdv"])) if s["d_hdv"] else 0.0,
+            }
+
+        # Global (backward-compatible)
+        self.approach_delay_values = {
+            "timeseries": timeseries,
+            "summary": summary,
+            "hdv": float(np.mean(global_delays["hdv"])) if global_delays["hdv"] else 0.0,
+            "cav": float(np.mean(global_delays["cav"])) if global_delays["cav"] else 0.0,
         }
-        if debug:
-            print(f"[GOR-byType] tls_id={chosen_tls} green_time={green_time_total:.1f}s cav={gor_cav} hdv={gor_hdv}")
-    
-    # ------------------------------
-    # 3. Approach Delay
-    # ------------------------------
-    def compute_approach_delay(self, free_flow_speed_hdv=13.0, free_flow_speed_cav=15.0):
-        """
-        Compute average approach delay per vehicle.
-        Delay = actual elapsed time − free‑flow time (based on full‑trajectory approximation).
-        """
-        self.approach_delay_values = {"hdv": 0.0, "cav": 0.0}
-        for v_type in ["hdv", "cav"]:
-            delays = []
-            for veh_id, traj in self.positions[v_type].items():
-                if not traj: continue
-                (t0, p0) = traj[0]; (t1, p1) = traj[-1]
-                travel_time = max(0.0, t1 - t0)
-                dist = max(0.0, p1 - p0)
-                v_ff = free_flow_speed_hdv if v_type == "hdv" else free_flow_speed_cav
-                ff_time = dist / max(v_ff, 0.1)
-                delays.append(max(0.0, travel_time - ff_time))
-            self.approach_delay_values[v_type] = float(np.mean(delays)) if delays else 0.0
 
-        print(f"Average approach delay - HDV: {self.approach_delay_values['hdv']:.2f}s, "
-              f"CAV: {self.approach_delay_values['cav']:.2f}s")
+        if _VERBOSE:
+            print(f"Average approach delay - HDV: {self.approach_delay_values['hdv']:.2f}s, "
+                  f"CAV: {self.approach_delay_values['cav']:.2f}s, "
+                  f"{len(summary)} intersections, {len(timeseries)} window-records")
 
     # =========================
-    # 4. Queue Spillback Occurrence
+    # Queue Spillback Occurrence
     # =========================
 
     def compute_queue_spillback(self, occ_threshold=0.8):
@@ -2721,42 +2989,45 @@ class TrafficMetrics:
         """
 
         self.spillback_events = []   # full event log
-        current_event = {}           # ongoing event (if any)
-
+        by_detector = defaultdict(list)
         for d in self.detector_data:
-            lane = d["lane"]
-            occ = d["occ"] / 100.0   # convert % to fraction
-            nVeh = d["nVeh"]
-            begin = d["begin"]
-            end = d["end"]
+            det_key = d.get("id") or d.get("detector_id") or d.get("lane")
+            by_detector[det_key].append(d)
 
-            if occ >= occ_threshold and nVeh == 0:
-                # spillback condition triggered
-                if not current_event:
-                    # start a new event
-                    current_event = {
-                        "lane": lane,
-                        "start": begin,
-                        "end": end,
-                        "max_occ": occ,
-                    }
+        for det_key, recs in by_detector.items():
+            current_event = None
+            recs = sorted(recs, key=lambda x: (float(x.get("begin", 0.0)), float(x.get("end", 0.0))))
+
+            for d in recs:
+                lane_label = d.get("lane") or det_key
+                occ = float(d["occ"]) / 100.0   # convert % to fraction
+                nVeh = int(d["nVeh"])
+                begin = float(d["begin"])
+                end = float(d["end"])
+
+                if occ >= occ_threshold and nVeh == 0:
+                    if current_event is None:
+                        current_event = {
+                            "lane": lane_label,
+                            "detector_id": det_key,
+                            "start": begin,
+                            "end": end,
+                            "max_occ": occ,
+                        }
+                    else:
+                        current_event["end"] = end
+                        current_event["max_occ"] = max(current_event["max_occ"], occ)
                 else:
-                    # extend ongoing event
-                    current_event["end"] = end
-                    current_event["max_occ"] = max(current_event["max_occ"], occ)
-            else:
-                # spillback ended
-                if current_event:
-                    duration = current_event["end"] - current_event["start"]
-                    current_event["duration"] = duration
-                    self.spillback_events.append(current_event)
-                    current_event = {}
+                    if current_event is not None:
+                        duration = current_event["end"] - current_event["start"]
+                        current_event["duration"] = duration
+                        self.spillback_events.append(current_event)
+                        current_event = None
 
-        # close last open event if exists
-        if current_event:
-            duration = current_event["end"] - current_event["start"]
-            current_event["duration"] = duration
-            self.spillback_events.append(current_event)
+            if current_event is not None:
+                duration = current_event["end"] - current_event["start"]
+                current_event["duration"] = duration
+                self.spillback_events.append(current_event)
 
         # summary stats
         if self.spillback_events:
@@ -2773,136 +3044,768 @@ class TrafficMetrics:
                 "avg_duration": 0.0,
             }
 
-        # print log for debugging
-        print("[Spillback Events]")
-        for e in self.spillback_events:
-            print(f"Lane={e['lane']} | Start={e['start']:.1f}s | End={e['end']:.1f}s | "
-                f"Duration={e['duration']:.1f}s | MaxOcc={e['max_occ']:.2f}")
+        if _VERBOSE:
+            print("[Spillback Events]")
+            for e in self.spillback_events:
+                print(f"Lane={e['lane']} | Start={e['start']:.1f}s | End={e['end']:.1f}s | "
+                    f"Duration={e['duration']:.1f}s | MaxOcc={e['max_occ']:.2f}")
 
     # =========================
-    # 5. Time to Service 
+    # Throughput (Discharged Vehicles) — intersection-level, time-windowed
     # =========================
-    def compute_time_to_service(self, tls_id=None, detector_filter=None, count_yellow_as_green=False, debug=False):
+    def compute_throughput(self, window_s=300.0):
         """
-        Compute Time To Service (TTS) split by CAV/HDV using FCD-based arrivals:
-        - For each detector interval and mapped lane, find each vehicle's first‑seen
-          time within that interval (arrival).
-        - TTS = time from arrival to the next green start (or 0 if arriving during green).
-        - Aggregate TTS per vehicle type.
+        Compute intersection throughput from detector data.
+
+        Aggregates nVeh per intersection per time window, split by vehicle type
+        (when FCD type info is available).
 
         Sets
         ----
-        self.time_to_service_split = {
-            "cav": {"avg": ..., "p50": ..., "p95": ..., "n": N_cav},
-            "hdv": {"avg": ..., "p50": ..., "p95": ..., "n": N_hdv},
-            "all": {"avg": ..., "p50": ..., "p95": ..., "n": N_all},
-            "tls_id": <chosen tls>
+        self.throughput_values = {
+            "timeseries": list[dict],   # per intersection per window
+            "summary": dict,            # per intersection aggregates
+            # Global backward-compatible fields:
+            "total_vehicles": int,
+            "total_hours": float,
+            "vehicles_per_hour": float,
+            "cav_vehicles": int, "hdv_vehicles": int,
+            "cav_vehicles_per_hour": float, "hdv_vehicles_per_hour": float,
         }
         """
-        # Checks
+        _empty = {
+            "timeseries": [], "summary": {},
+            "total_vehicles": 0, "total_hours": 0.0,
+            "vehicles_per_hour": 0.0,
+            "cav_vehicles": 0, "hdv_vehicles": 0,
+            "cav_vehicles_per_hour": 0.0, "hdv_vehicles_per_hour": 0.0,
+        }
         if not getattr(self, "detector_data", None):
-            print("[TTS-byType] Missing detector data.")
-            self.time_to_service_split = {}
-            return
-        if not (hasattr(self, "timesteps") and hasattr(self, "timestep_lane_positions")):
-            print("[TTS-byType] Missing FCD timesteps/lanes.")
-            self.time_to_service_split = {}
+            print("[Throughput] No detector data available.")
+            self.throughput_values = _empty
             return
 
-        green_windows, is_static, cycle_len, chosen_tls = self._get_green_windows(tls_id)
-        if not green_windows:
-            print("[TTS-byType] Missing TLS green windows.")
-            self.time_to_service_split = {}
-            return
+        detector_mapping = getattr(self, "detector_mapping", None)
+        has_fcd = hasattr(self, "timesteps") and hasattr(self, "timestep_lane_positions")
 
-        # Precompute green starts for fast lookup
-        green_starts = [gs for gs, ge in green_windows]
-        times = list(self.timesteps)
-        time_to_idx = {t: i for i, t in enumerate(times)}
+        def _det_intersection(det_id):
+            if isinstance(detector_mapping, dict):
+                mp = detector_mapping.get(det_id, {})
+                return mp.get("tls_id") or "unknown"
+            return "unknown"
 
-        # Helpers
-        def is_cav(veh_id: str) -> bool:
-            return "_cav" in (veh_id or "").lower()
+        # Aggregate by (intersection_id, begin, end)
+        interval_map = defaultdict(lambda: {"nVeh": 0, "cav": 0, "hdv": 0})
 
-        def next_green_start(t_arr: float) -> float:
-            """Return the next green start time >= t_arr; if none, return None."""
-            idx = bisect.bisect_left(green_starts, t_arr)
-            if idx < len(green_starts):
-                return green_starts[idx]
-            return None  # no future green start in the window
-
-        # Collect TTS per type
-        tts_all = []
-        tts_cav = []
-        tts_hdv = []
-
-        # (optional) only consider certain lanes
-        allowed = set(detector_filter) if detector_filter else None
-
-        # Use detector_data's lane field directly to look up in FCD
         for d in self.detector_data:
-            lane = self._resolve_lane_key(d)
-            if allowed is not None and lane not in allowed:
-                continue
-            t0 = float(d["begin"]); t1 = float(d["end"])
-            if t1 <= t0:
-                continue
+            begin = float(d["begin"])
+            end = float(d["end"])
+            nVeh = int(d.get("nVeh", 0))
+            det_id = d.get("id") or d.get("detector_id") or d.get("lane")
+            int_id = _det_intersection(det_id)
 
-            # First‑appearance times within this interval
-            i0 = bisect.bisect_left(times, t0 - 1e-9)
-            i1 = bisect.bisect_right(times, t1 + 1e-9)
-            first_seen = {}  # veh_id -> arrival time in this interval
+            interval_map[(int_id, begin, end)]["nVeh"] += nVeh
 
-            for i in range(i0, i1):
-                t = times[i]
-                vehs = self.timestep_lane_positions.get(t, {}).get(lane, {})
-                if not vehs:
-                    continue
-                for vid in vehs.keys():
-                    if vid not in first_seen:
-                        first_seen[vid] = t
+            # FCD-based type split
+            if has_fcd and nVeh > 0:
+                det_id_r, lane_id, _, _ = self._resolve_detector_control(d, detector_mapping)
+                if lane_id:
+                    times = list(self.timesteps)
+                    i0 = bisect.bisect_left(times, begin - 1e-9)
+                    i1 = bisect.bisect_right(times, end + 1e-9)
+                    seen_vehs = set()
+                    for i in range(i0, i1):
+                        t = times[i]
+                        vehs = self._lane_vehicle_map_at_time(t, lane_id, allow_edge_fallback=True)
+                        if vehs:
+                            seen_vehs.update(vehs.keys())
+                    for vid in seen_vehs:
+                        if "_cav" in (vid or "").lower():
+                            interval_map[(int_id, begin, end)]["cav"] += 1
+                        else:
+                            interval_map[(int_id, begin, end)]["hdv"] += 1
 
-            if not first_seen:
-                continue
+        if not interval_map:
+            self.throughput_values = _empty
+            return
 
-            # Compute TTS per vehicle
-            for vid, t_arr in first_seen.items():
-                # Arriving during green => TTS=0
-                in_green = any(gs <= t_arr < ge for gs, ge in green_windows)
-                if in_green:
-                    tts = 0.0
-                else:
-                    ng = next_green_start(t_arr)
-                    tts = max(0.0, (ng - t_arr)) if ng is not None else 0.0
+        # Global time range
+        all_begins = [k[1] for k in interval_map]
+        all_ends = [k[2] for k in interval_map]
+        t_min = min(all_begins)
+        t_max = max(all_ends)
 
-                tts_all.append(tts)
-                if is_cav(vid):
-                    tts_cav.append(tts)
-                else:
-                    tts_hdv.append(tts)
+        # Build fixed time windows
+        windows = _build_time_windows(t_min, t_max, window_s)
+        if not windows:
+            windows = [(t_min, t_max)]
 
-        def stats(arr):
-            if not arr:
-                return {"avg": None, "p50": None, "p95": None, "n": 0}
-            a = np.array(arr, dtype=float)
-            return {
-                "avg": float(a.mean()),
-                "p50": float(np.percentile(a, 50)),
-                "p95": float(np.percentile(a, 95)),
-                "n": int(a.size),
+        # Aggregate per (intersection_id, window_idx)
+        window_agg = defaultdict(lambda: {"nVeh": 0, "cav": 0, "hdv": 0})
+        for (int_id, begin, end), counts in interval_map.items():
+            mid = (begin + end) / 2.0
+            w_idx = min(int((mid - t_min) / window_s), len(windows) - 1) if window_s > 0 else 0
+            window_agg[(int_id, w_idx)]["nVeh"] += counts["nVeh"]
+            window_agg[(int_id, w_idx)]["cav"] += counts["cav"]
+            window_agg[(int_id, w_idx)]["hdv"] += counts["hdv"]
+
+        # Build timeseries
+        timeseries = []
+        for (int_id, w_idx), counts in sorted(window_agg.items()):
+            ws, we = windows[min(w_idx, len(windows) - 1)]
+            window_hours = max((we - ws) / 3600.0, 1e-9)
+            timeseries.append({
+                "intersection_id": int_id,
+                "window_start": ws,
+                "window_end": we,
+                "vehicles": counts["nVeh"],
+                "vehicles_per_hour": counts["nVeh"] / window_hours,
+                "cav": counts["cav"],
+                "hdv": counts["hdv"],
+            })
+
+        # Per-intersection summary
+        int_agg = defaultdict(lambda: {"total_veh": 0, "total_cav": 0, "total_hdv": 0, "vph_list": []})
+        for row in timeseries:
+            a = int_agg[row["intersection_id"]]
+            a["total_veh"] += row["vehicles"]
+            a["total_cav"] += row["cav"]
+            a["total_hdv"] += row["hdv"]
+            a["vph_list"].append(row["vehicles_per_hour"])
+
+        summary = {}
+        for int_id, a in int_agg.items():
+            summary[int_id] = {
+                "intersection_id": int_id,
+                "total_vehicles": a["total_veh"],
+                "total_cav": a["total_cav"],
+                "total_hdv": a["total_hdv"],
+                "mean_vehicles_per_hour": float(np.mean(a["vph_list"])) if a["vph_list"] else 0.0,
+                "peak_vehicles_per_hour": float(max(a["vph_list"])) if a["vph_list"] else 0.0,
             }
 
-        self.time_to_service_split = {
-            "cav": stats(tts_cav),
-            "hdv": stats(tts_hdv),
-            "all": stats(tts_all),
-            "tls_id": chosen_tls,
+        # Global summary (backward-compatible)
+        total_veh = sum(a["total_veh"] for a in int_agg.values())
+        total_cav = sum(a["total_cav"] for a in int_agg.values())
+        total_hdv = sum(a["total_hdv"] for a in int_agg.values())
+        total_hours = max(0.0, (t_max - t_min) / 3600.0)
+
+        self.throughput_values = {
+            "timeseries": timeseries,
+            "summary": summary,
+            "total_vehicles": total_veh,
+            "total_hours": total_hours,
+            "vehicles_per_hour": total_veh / total_hours if total_hours > 0 else 0.0,
+            "cav_vehicles": total_cav,
+            "hdv_vehicles": total_hdv,
+            "cav_vehicles_per_hour": total_cav / total_hours if total_hours > 0 else 0.0,
+            "hdv_vehicles_per_hour": total_hdv / total_hours if total_hours > 0 else 0.0,
         }
 
-        if debug:
-            print(f"[TTS-byType] tls={chosen_tls}  all(avg={self.time_to_service_split['all']['avg']}) "
-                f"CAV(avg={self.time_to_service_split['cav']['avg']}) "
-                f"HDV(avg={self.time_to_service_split['hdv']['avg']})")
+        if _VERBOSE:
+            print(f"[Throughput] total={total_veh} veh, {self.throughput_values['vehicles_per_hour']:.0f} veh/hr "
+                  f"(CAV={total_cav}, HDV={total_hdv}) over {total_hours:.2f} hr, "
+                  f"{len(summary)} intersections, {len(timeseries)} window-records")
+
+    # =========================
+    # Average Delay (intersection-level, pooled) — time-windowed
+    # =========================
+    def compute_average_delay(self, free_flow_speed=13.0, stop_speed_thresh=2.0, window_s=300.0):
+        """
+        Compute pooled intersection-level average delay using FCD data.
+
+        For each vehicle traversing any approach lane:
+          delay = actual_travel_time - free_flow_time
+        Also computes stopped delay (time at speed < stop_speed_thresh).
+
+        Results are grouped by intersection_id and time window.
+
+        Sets
+        ----
+        self.average_delay_values = {
+            "timeseries": list[dict],   # per intersection per window
+            "summary": dict,            # per intersection aggregates
+            # Global backward-compatible fields:
+            "avg_delay_all": float, "avg_delay_cav": float, "avg_delay_hdv": float,
+            "avg_stopped_delay_all": float, ...,
+            "n_all": int, "n_cav": int, "n_hdv": int,
+        }
+        """
+        _empty = {
+            "timeseries": [], "summary": {},
+            "avg_delay_all": 0.0, "avg_delay_cav": 0.0, "avg_delay_hdv": 0.0,
+            "avg_stopped_delay_all": 0.0, "avg_stopped_delay_cav": 0.0,
+            "avg_stopped_delay_hdv": 0.0,
+            "n_all": 0, "n_cav": 0, "n_hdv": 0,
+        }
+        self.average_delay_values = _empty
+
+        lane_int_map = self._get_lane_intersection_map()
+        approach_lanes = set(lane_int_map.keys())
+
+        if not approach_lanes or not getattr(self, "timesteps", None):
+            print("[AvgDelay] No approach lanes or FCD data.")
+            return
+
+        times = list(self.timesteps)
+        dt = times[1] - times[0] if len(times) > 1 else 0.1
+
+        # Track each vehicle's traversal with intersection context
+        # key = (lane_id, veh_id)
+        traversals = {}
+
+        for t in times:
+            lane_dict = self.timestep_lane_positions.get(t, {})
+            for lane_id in approach_lanes:
+                vehs = lane_dict.get(lane_id)
+                if vehs is None:
+                    vehs = self._lane_vehicle_map_at_time(t, lane_id, allow_edge_fallback=True)
+                if not vehs:
+                    continue
+                int_id = lane_int_map.get(lane_id, "unknown")
+                for veh_id, pos in vehs.items():
+                    key = (lane_id, veh_id)
+                    rec = traversals.get(key)
+                    if rec is None:
+                        vtype = self.vehicle_info.get(veh_id, {}).get("type")
+                        if vtype not in ("hdv", "cav"):
+                            vtype = "cav" if "_cav" in (veh_id or "").lower() else "hdv"
+                        traversals[key] = {
+                            "t0": float(t), "p0": float(pos),
+                            "t1": float(t), "p1": float(pos),
+                            "stopped_time": 0.0, "prev_pos": float(pos),
+                            "vtype": vtype, "int_id": int_id,
+                        }
+                    else:
+                        speed = abs(float(pos) - rec["prev_pos"]) / max(dt, 1e-6)
+                        if speed < stop_speed_thresh:
+                            rec["stopped_time"] += dt
+                        rec["t1"] = float(t)
+                        rec["p1"] = float(pos)
+                        rec["prev_pos"] = float(pos)
+
+        # Compute delay per traversal and assign to time window
+        min_distance_m = 10.0
+        t_min = times[0] if times else 0.0
+        t_max = times[-1] if times else 0.0
+        windows = _build_time_windows(t_min, t_max, window_s)
+        if not windows:
+            windows = [(t_min, t_max)]
+
+        # Collect per (int_id, w_idx): lists of delays
+        win_data = defaultdict(lambda: {"delays_cav": [], "delays_hdv": [],
+                                         "stopped_cav": [], "stopped_hdv": []})
+        global_delays = {"cav": [], "hdv": []}
+        global_stopped = {"cav": [], "hdv": []}
+
+        for rec in traversals.values():
+            travel_time = max(0.0, rec["t1"] - rec["t0"])
+            dist = max(0.0, rec["p1"] - rec["p0"])
+            if dist < min_distance_m or travel_time <= 0.0:
+                continue
+            ff_time = dist / max(free_flow_speed, 0.1)
+            delay = max(0.0, travel_time - ff_time)
+            vtype = rec["vtype"]
+            int_id = rec["int_id"]
+
+            # Assign to window by departure time
+            w_idx = min(int((rec["t1"] - t_min) / window_s), len(windows) - 1) if window_s > 0 else 0
+            wd = win_data[(int_id, w_idx)]
+            wd[f"delays_{vtype}"].append(delay)
+            wd[f"stopped_{vtype}"].append(rec["stopped_time"])
+            global_delays[vtype].append(delay)
+            global_stopped[vtype].append(rec["stopped_time"])
+
+        # Build timeseries
+        timeseries = []
+        for (int_id, w_idx), wd in sorted(win_data.items()):
+            ws, we = windows[min(w_idx, len(windows) - 1)]
+            all_d = wd["delays_cav"] + wd["delays_hdv"]
+            all_s = wd["stopped_cav"] + wd["stopped_hdv"]
+            timeseries.append({
+                "intersection_id": int_id,
+                "window_start": ws,
+                "window_end": we,
+                "avg_delay_all": float(np.mean(all_d)) if all_d else 0.0,
+                "avg_delay_cav": float(np.mean(wd["delays_cav"])) if wd["delays_cav"] else 0.0,
+                "avg_delay_hdv": float(np.mean(wd["delays_hdv"])) if wd["delays_hdv"] else 0.0,
+                "avg_stopped_delay_all": float(np.mean(all_s)) if all_s else 0.0,
+                "n_all": len(all_d),
+                "n_cav": len(wd["delays_cav"]),
+                "n_hdv": len(wd["delays_hdv"]),
+            })
+
+        # Per-intersection summary
+        int_summary = defaultdict(lambda: {"delays_all": [], "delays_cav": [], "delays_hdv": [],
+                                            "stopped_all": []})
+        for row in timeseries:
+            s = int_summary[row["intersection_id"]]
+            if row["n_all"] > 0:
+                s["delays_all"].append(row["avg_delay_all"])
+            if row["n_cav"] > 0:
+                s["delays_cav"].append(row["avg_delay_cav"])
+            if row["n_hdv"] > 0:
+                s["delays_hdv"].append(row["avg_delay_hdv"])
+            if row["n_all"] > 0:
+                s["stopped_all"].append(row["avg_stopped_delay_all"])
+
+        summary = {}
+        for int_id, s in int_summary.items():
+            summary[int_id] = {
+                "intersection_id": int_id,
+                "avg_delay_all": float(np.mean(s["delays_all"])) if s["delays_all"] else 0.0,
+                "avg_delay_cav": float(np.mean(s["delays_cav"])) if s["delays_cav"] else 0.0,
+                "avg_delay_hdv": float(np.mean(s["delays_hdv"])) if s["delays_hdv"] else 0.0,
+                "avg_stopped_delay_all": float(np.mean(s["stopped_all"])) if s["stopped_all"] else 0.0,
+            }
+
+        # Global (backward-compatible)
+        all_delays = global_delays["cav"] + global_delays["hdv"]
+        all_stopped = global_stopped["cav"] + global_stopped["hdv"]
+
+        self.average_delay_values = {
+            "timeseries": timeseries,
+            "summary": summary,
+            "avg_delay_all": float(np.mean(all_delays)) if all_delays else 0.0,
+            "avg_delay_cav": float(np.mean(global_delays["cav"])) if global_delays["cav"] else 0.0,
+            "avg_delay_hdv": float(np.mean(global_delays["hdv"])) if global_delays["hdv"] else 0.0,
+            "avg_stopped_delay_all": float(np.mean(all_stopped)) if all_stopped else 0.0,
+            "avg_stopped_delay_cav": float(np.mean(global_stopped["cav"])) if global_stopped["cav"] else 0.0,
+            "avg_stopped_delay_hdv": float(np.mean(global_stopped["hdv"])) if global_stopped["hdv"] else 0.0,
+            "n_all": len(all_delays),
+            "n_cav": len(global_delays["cav"]),
+            "n_hdv": len(global_delays["hdv"]),
+        }
+
+        if _VERBOSE:
+            print(f"[AvgDelay] all={self.average_delay_values['avg_delay_all']:.2f}s "
+                  f"(CAV={self.average_delay_values['avg_delay_cav']:.2f}s, "
+                  f"HDV={self.average_delay_values['avg_delay_hdv']:.2f}s) "
+                  f"n={self.average_delay_values['n_all']}, "
+                  f"{len(summary)} intersections, {len(timeseries)} window-records")
+
+    # =========================
+    # Queue Count (queued vehicles) — per intersection, time-windowed
+    # =========================
+    def compute_queue_length(self, stop_speed_thresh=2.0, window_s=300.0):
+        """
+        Estimate queue by approach as the maximum queued vehicles during red for
+        each signal cycle, then summarize over all cycles.
+
+        The output keeps the existing `queue_length_values` container, but queue
+        is no longer defined on fixed 5-minute windows. Instead:
+          - cycle_records: one row per intersection + approach + cycle
+          - summary_rows: one row per intersection + approach with Average/Max Queue
+        """
+        _empty = {
+            "timeseries": [],
+            "summary": {},
+            "summary_rows": [],
+            "cycle_records": [],
+            "avg_queue_vehicles": 0.0,
+            "max_queue_vehicles": 0,
+            "avg_queue_cav": 0.0,
+            "avg_queue_hdv": 0.0,
+        }
+        self.queue_length_values = _empty
+
+        detector_mapping = getattr(self, "detector_mapping", None)
+        if not isinstance(detector_mapping, dict) or not detector_mapping:
+            print("[QueueCount] detector_mapping missing; skipping queue metric.")
+            return
+        if not getattr(self, "timesteps", None):
+            print("[QueueCount] No FCD timesteps available.")
+            return
+        edge_dirs = self._edge_direction_labels_from_net()
+
+        approach_specs = {}
+        _skip_no_lane = 0
+        _skip_no_tls = 0
+        _skip_no_groups = 0
+        for det_id, mp in detector_mapping.items():
+            lane_id = mp.get("sumo_lane") or mp.get("lane_id")
+            tls_id = mp.get("tls_id")
+            groups = mp.get("groups")
+            if lane_id is None:
+                _skip_no_lane += 1
+                continue
+            if tls_id is None:
+                _skip_no_tls += 1
+                continue
+            if groups is None:
+                _skip_no_groups += 1
+                continue
+            try:
+                group_list = sorted({int(g) for g in groups})
+            except Exception:
+                continue
+            if not group_list:
+                continue
+
+            edge_id = self._lane_edge_id(lane_id)
+            intersection_id = self._detector_intersection_id(det_id, tls_id=tls_id)
+            edge_dir = edge_dirs.get(edge_id, {})
+            direction_short = edge_dir.get("direction_short") or edge_id
+            direction_long = edge_dir.get("direction_long") or edge_id
+
+            key = (intersection_id, tls_id, edge_id)
+            rec = approach_specs.setdefault(
+                key,
+                {
+                    "intersection_id": intersection_id,
+                    "tls_id": tls_id,
+                    "approach_edge": edge_id,
+                    "approach_direction": direction_short,
+                    "approach_direction_long": direction_long,
+                    "lanes": {},
+                },
+            )
+            rec["lanes"][lane_id] = {
+                "groups": tuple(group_list),
+                "detector_id": det_id,
+            }
+
+        if not approach_specs:
+            print(f"[QueueCount] No detector-linked approaches with TLS groups. "
+                  f"(detectors={len(detector_mapping)}, skip_no_lane={_skip_no_lane}, "
+                  f"skip_no_tls={_skip_no_tls}, skip_no_groups={_skip_no_groups})")
+            return
+
+        cycle_lengths = {}
+        for rec in approach_specs.values():
+            tls_id = rec["tls_id"]
+            if tls_id in cycle_lengths:
+                continue
+            phases = (getattr(self, "tls_programs", {}) or {}).get(tls_id, [])
+            cycle_len = 0.0
+            for ph in phases:
+                try:
+                    cycle_len += float(ph.get("duration", 0.0))
+                except Exception:
+                    continue
+            if cycle_len <= 0:
+                inferred = self._infer_cycle_length_from_intervals(tls_id)
+                if inferred and inferred > 0:
+                    cycle_len = float(inferred)
+            if cycle_len > 0:
+                cycle_lengths[tls_id] = cycle_len
+
+        if not cycle_lengths:
+            print("[QueueCount] Could not determine signal cycle lengths.")
+            return
+
+        times = list(self.timesteps)
+        if len(times) < 2:
+            return
+
+        def lane_is_red(tls_id, groups, t):
+            state = self.tls_state(tls_id, t)
+            if state is None:
+                return False
+            try:
+                return all((gi >= len(state)) or (not _is_green_char(state[gi])) for gi in groups)
+            except Exception:
+                return False
+
+        cycle_max = {}
+        prev_time = None
+
+        for t in times:
+            if prev_time is None:
+                prev_time = t
+                continue
+            dt = max(1e-9, float(t) - float(prev_time))
+            lane_dict = self.timestep_lane_positions.get(t, {})
+            prev_lane_dict = self.timestep_lane_positions.get(prev_time, {})
+            if not lane_dict:
+                prev_time = t
+                continue
+
+            for (intersection_id, tls_id, edge_id), rec in approach_specs.items():
+                cycle_len = cycle_lengths.get(tls_id)
+                if not cycle_len or cycle_len <= 0:
+                    continue
+
+                cycle_index = int(max(0.0, float(t)) // cycle_len)
+                cycle_start = cycle_index * cycle_len
+                cycle_end = cycle_start + cycle_len
+                approach_key = (
+                    intersection_id,
+                    rec["approach_direction"],
+                    edge_id,
+                    tls_id,
+                    cycle_index,
+                    cycle_start,
+                    cycle_end,
+                )
+
+                queued_now = 0
+                for lane_id, lane_meta in rec["lanes"].items():
+                    groups = lane_meta["groups"]
+                    if not lane_is_red(tls_id, groups, t):
+                        continue
+                    vehs_now = lane_dict.get(lane_id)
+                    if vehs_now is None:
+                        vehs_now = self._lane_vehicle_map_at_time(t, lane_id, allow_edge_fallback=True)
+                    vehs_prev = prev_lane_dict.get(lane_id)
+                    if vehs_prev is None:
+                        vehs_prev = self._lane_vehicle_map_at_time(prev_time, lane_id, allow_edge_fallback=True)
+                    if not vehs_now:
+                        continue
+                    for veh_id, pos_now in vehs_now.items():
+                        pos_prev = (vehs_prev or {}).get(veh_id)
+                        if pos_prev is None:
+                            continue
+                        speed = abs(float(pos_now) - float(pos_prev)) / dt
+                        if speed < float(stop_speed_thresh):
+                            queued_now += 1
+
+                cycle_max[approach_key] = max(cycle_max.get(approach_key, 0), int(queued_now))
+            prev_time = t
+
+        cycle_records = []
+        grouped = defaultdict(list)
+        for (
+            intersection_id,
+            approach_direction,
+            edge_id,
+            tls_id,
+            cycle_index,
+            cycle_start,
+            cycle_end,
+        ), max_q in sorted(cycle_max.items(), key=lambda item: item[0]):
+            cycle_records.append({
+                "intersection_id": intersection_id,
+                "tls_id": tls_id,
+                "approach_edge": edge_id,
+                "approach_direction": approach_direction,
+                "cycle_index": int(cycle_index),
+                "cycle_start": float(cycle_start),
+                "cycle_end": float(cycle_end),
+                "cycle_max_queue": int(max_q),
+            })
+            grouped[(intersection_id, approach_direction, edge_id, tls_id)].append(int(max_q))
+
+        summary_rows = []
+        summary = {}
+        all_avg = []
+        all_max = []
+        for (intersection_id, approach_direction, edge_id, tls_id), vals in sorted(grouped.items()):
+            arr = np.array(vals, dtype=float)
+            avg_q = float(arr.mean()) if arr.size else 0.0
+            max_q = int(arr.max()) if arr.size else 0
+            row = {
+                "intersection_id": intersection_id,
+                "tls_id": tls_id,
+                "approach_edge": edge_id,
+                "approach_direction": approach_direction,
+                "Average Queue": avg_q,
+                "Max Queue": max_q,
+                "cycle_count": int(arr.size),
+            }
+            summary_rows.append(row)
+            summary.setdefault(intersection_id, []).append(row)
+            all_avg.append(avg_q)
+            all_max.append(max_q)
+
+        self.queue_length_values = {
+            "timeseries": [],
+            "summary": summary,
+            "summary_rows": summary_rows,
+            "cycle_records": cycle_records,
+            "avg_queue_vehicles": float(np.mean(all_avg)) if all_avg else 0.0,
+            "max_queue_vehicles": int(max(all_max)) if all_max else 0,
+            "avg_queue_cav": 0.0,
+            "avg_queue_hdv": 0.0,
+        }
+
+        if _VERBOSE:
+            print(
+                f"[QueueCount] cycle-based queue computed for {len(summary_rows)} approaches "
+                f"across {len(summary)} intersections; global avg={self.queue_length_values['avg_queue_vehicles']:.1f} "
+                f"veh, max={self.queue_length_values['max_queue_vehicles']} veh"
+            )
+
+    # =========================
+    # v/c Ratio (Volume / Capacity) — per intersection, time-windowed
+    # =========================
+    def compute_vc_ratio(self, saturation_flow_rate=1800.0, window_s=300.0):
+        """
+        Estimate volume-to-capacity ratio per intersection per time window.
+
+        volume = detector flow rate (veh/hr per lane group)
+        capacity = (effective_green / cycle_length) * saturation_flow_rate
+
+        Sets
+        ----
+        self.vc_ratio_values = {
+            "timeseries": list[dict],   # per intersection per window
+            "summary": dict,            # per intersection aggregates
+            # Global backward-compatible:
+            "vc_ratio_avg": float,
+            "vc_ratio_max": float,
+            "volume_vph": float,
+            "capacity_vph": float,
+            "per_detector": list[dict],
+        }
+        """
+        _empty = {
+            "timeseries": [], "summary": {},
+            "vc_ratio_avg": 0.0, "vc_ratio_max": 0.0,
+            "volume_vph": 0.0, "capacity_vph": 0.0,
+            "per_detector": [],
+        }
+        self.vc_ratio_values = _empty
+
+        if not getattr(self, "detector_data", None):
+            print("[v/c Ratio] No detector data available.")
+            return
+
+        detector_mapping = getattr(self, "detector_mapping", None)
+
+        def _det_intersection(det_id):
+            if isinstance(detector_mapping, dict):
+                mp = detector_mapping.get(det_id, {})
+                return mp.get("tls_id") or "unknown"
+            return "unknown"
+
+        # g/C cache
+        gc_cache = {}
+
+        def get_gc_ratio(tls_id, groups):
+            cache_key = (tls_id, tuple(groups or ()))
+            if cache_key in gc_cache:
+                return gc_cache[cache_key]
+            green_windows, is_static, cycle_len, chosen_tls = self._get_green_windows_for_groups(
+                tls_id=tls_id, groups=groups)
+            if not green_windows or not cycle_len or cycle_len <= 0:
+                if green_windows:
+                    total_green = sum(ge - gs for gs, ge in green_windows)
+                    total_span = green_windows[-1][1] - green_windows[0][0]
+                    gc = total_green / total_span if total_span > 0 else 0.5
+                else:
+                    gc = 0.5
+            else:
+                total_green = sum(ge - gs for gs, ge in green_windows)
+                gc = total_green / cycle_len
+            gc = max(0.01, min(1.0, gc))
+            gc_cache[cache_key] = gc
+            return gc
+
+        # Aggregate per (det_id, window_idx)
+        # First find global time range
+        all_begins = [float(d["begin"]) for d in self.detector_data]
+        all_ends = [float(d["end"]) for d in self.detector_data]
+        t_min = min(all_begins)
+        t_max = max(all_ends)
+        windows = _build_time_windows(t_min, t_max, window_s)
+        if not windows:
+            windows = [(t_min, t_max)]
+
+        # Per (det_id, w_idx) accumulator
+        det_win_flows = defaultdict(lambda: {"nVeh": 0, "duration_s": 0.0,
+                                              "tls_id": None, "groups": None, "int_id": "unknown"})
+
+        for d in self.detector_data:
+            det_id, lane_id, tls_id, groups = self._resolve_detector_control(d, detector_mapping)
+            begin = float(d["begin"])
+            end = float(d["end"])
+            nVeh = int(d.get("nVeh", 0))
+            duration = end - begin
+            if duration <= 0:
+                continue
+            int_id = _det_intersection(det_id)
+            mid = (begin + end) / 2.0
+            w_idx = min(int((mid - t_min) / window_s), len(windows) - 1) if window_s > 0 else 0
+
+            rec = det_win_flows[(det_id, w_idx)]
+            rec["nVeh"] += nVeh
+            rec["duration_s"] += duration
+            rec["int_id"] = int_id
+            if tls_id:
+                rec["tls_id"] = tls_id
+                rec["groups"] = groups
+
+        # Per (int_id, w_idx) aggregate v/c
+        int_win_vc = defaultdict(lambda: {"vc_list": [], "vol_total": 0.0, "cap_total": 0.0})
+        per_detector = []
+        global_vc_list = []
+        global_vol = 0.0
+        global_cap = 0.0
+
+        for (det_id, w_idx), rec in det_win_flows.items():
+            if rec["duration_s"] <= 0:
+                continue
+            volume_vph = rec["nVeh"] / (rec["duration_s"] / 3600.0)
+            gc = get_gc_ratio(rec["tls_id"], rec["groups"]) if rec["tls_id"] else 0.5
+            capacity_vph = gc * saturation_flow_rate
+            vc = volume_vph / capacity_vph if capacity_vph > 0 else 0.0
+
+            int_id = rec["int_id"]
+            iwv = int_win_vc[(int_id, w_idx)]
+            iwv["vc_list"].append(vc)
+            iwv["vol_total"] += volume_vph
+            iwv["cap_total"] += capacity_vph
+
+            global_vc_list.append(vc)
+            global_vol += volume_vph
+            global_cap += capacity_vph
+
+            per_detector.append({
+                "detector_id": det_id,
+                "window_idx": w_idx,
+                "intersection_id": int_id,
+                "volume_vph": round(volume_vph, 1),
+                "capacity_vph": round(capacity_vph, 1),
+                "gc_ratio": round(gc, 3),
+                "vc_ratio": round(vc, 3),
+            })
+
+        # Build timeseries
+        timeseries = []
+        for (int_id, w_idx), iwv in sorted(int_win_vc.items()):
+            ws, we = windows[min(w_idx, len(windows) - 1)]
+            timeseries.append({
+                "intersection_id": int_id,
+                "window_start": ws,
+                "window_end": we,
+                "vc_ratio_avg": float(np.mean(iwv["vc_list"])) if iwv["vc_list"] else 0.0,
+                "vc_ratio_max": float(max(iwv["vc_list"])) if iwv["vc_list"] else 0.0,
+                "volume_vph": round(iwv["vol_total"], 1),
+                "capacity_vph": round(iwv["cap_total"], 1),
+            })
+
+        # Per-intersection summary
+        int_agg = defaultdict(lambda: {"vc_avg_list": [], "vc_max_list": []})
+        for row in timeseries:
+            a = int_agg[row["intersection_id"]]
+            a["vc_avg_list"].append(row["vc_ratio_avg"])
+            a["vc_max_list"].append(row["vc_ratio_max"])
+
+        summary = {}
+        for int_id, a in int_agg.items():
+            summary[int_id] = {
+                "intersection_id": int_id,
+                "vc_ratio_avg": float(np.mean(a["vc_avg_list"])) if a["vc_avg_list"] else 0.0,
+                "vc_ratio_max": float(max(a["vc_max_list"])) if a["vc_max_list"] else 0.0,
+            }
+
+        # Global (backward-compatible)
+        self.vc_ratio_values = {
+            "timeseries": timeseries,
+            "summary": summary,
+            "vc_ratio_avg": float(np.mean(global_vc_list)) if global_vc_list else 0.0,
+            "vc_ratio_max": float(max(global_vc_list)) if global_vc_list else 0.0,
+            "volume_vph": round(global_vol, 1),
+            "capacity_vph": round(global_cap, 1),
+            "per_detector": per_detector,
+        }
+
+        if _VERBOSE:
+            print(f"[v/c Ratio] avg={self.vc_ratio_values['vc_ratio_avg']:.3f}, "
+                  f"max(critical)={self.vc_ratio_values['vc_ratio_max']:.3f}, "
+                  f"total vol={global_vol:.0f} vph, cap={global_cap:.0f} vph, "
+                  f"{len(summary)} intersections, {len(timeseries)} window-records")
 
     def audit_summary(self):
         def _n(d): return sum(len(v) for v in d.values()) if isinstance(d, dict) else 0
@@ -2941,6 +3844,32 @@ class TrafficMetrics:
         print("PET   :", {k:len(v) for k,v in self.pet_list.items()})
         print("travel_times veh:", {k:len(v) for k,v in self.travel_times.items()})
 
-if __name__ == "__main__":
-    pass
+# ## ---------------------------------------------------------- ##
 
+# def main():
+#     # Handle input arguments
+#     parser = argparse.ArgumentParser('Python SUMO data analysis and visualization tool')
+#     parser.add_argument('--scenario_folder',
+#         help='Directory path to search for output file to plot: ["sumo_scenarios", "dev/sumo_scenarios"]. Default "sumo_scenarios"',
+#         default="sumo_scenarios", nargs="?", type=str)
+#     parser.add_argument('--scenario',
+#         help='Select SUMO scenario to analyze from with <scenario_folder>/: ["onramp", "i24"]. Default "onramp"',
+#         default="onramp", nargs="?", type=str)
+#     parser.add_argument('--file',
+#         help='File to plot from <scenario_folder>/<scenario>/output/. Default "fcd.xml"',
+#         default="fcd.xml", nargs="?", type=str)
+#     parser.add_argument('--plotting',
+#         help='Flag to create plots from output file. Default true.', 
+#             default=True, action='store_true')
+#     parser.add_argument('--saving',
+#         help='Flag to save plots from output file. Default true.', 
+#             default=True, action='store_true')
+#     args = parser.parse_args()
+
+
+if __name__ == "__main__":
+    print("not implemented")
+
+    # main()
+    # ax = vis.visualize_fcd("sumo_scenarios/onramp/output/fcd.xml", lanes=None, color_by="fuel_gps") # test function
+    # ax.figure.savefig("test.png", dpi=300)

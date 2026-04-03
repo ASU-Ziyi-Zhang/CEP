@@ -40,7 +40,7 @@ class MOBILStatus(Enum):
 
 ### Settings
 # Simulation settings
-TEND = 300. # progressed time until simulation ends automatically [s]
+# TEND = 300. # progressed time until simulation ends automatically [s]
 
 # Vehicle parameter settings
 VEHWIDTH = 1.90 # assumed external vehicle width [m]

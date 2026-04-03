@@ -1,12 +1,12 @@
 <?xml version='1.0' encoding='UTF-8'?>
 <routes>
 
-	<vType id="hdv" length="4.3" carFollowModel="IDM" emergencyDecel="4.0" laneChangeModel="SL2015" latAlignment="arbitrary" lcKeepRight="0.0" lcOvertakeRight="0.0" maxSpeed="30.55" minGap="2.5" accel="1.0" decel="2" tau="1.4" lcSublane="1.0" maxSpeedLat="5" lcAccelLat="1.2" minGapLat="0.4" lcStrategic="50" lcCooperative="1.0" lcPushy="0.4" lcImpatience="0.9" lcSpeedGain="1.5" color="#1f77b4"/>
-    <vType id="cav" length="4.3" carFollowModel="IDM" emergencyDecel="4.0" laneChangeModel="SL2015" latAlignment="arbitrary" lcKeepRight="0.0" lcOvertakeRight="0.0" maxSpeed="30.55" minGap="2.5" accel="1.0" decel="2" tau="1.4" lcSublane="1.0" maxSpeedLat="5" lcAccelLat="1.2" minGapLat="0.4" lcStrategic="50" lcCooperative="1.0" lcPushy="0.4" lcImpatience="0.9" lcSpeedGain="1.5" color="#d62728"/>
 
+  <vType id="hdv" carFollowModel="IDM" speedFactor="1" maxSpeed="35.46631186967486" minGap="2.94390525189298" accel="2.3655452248462066" decel="3.207636533267079" tau="1.6603715426741472" emergencyDecel="8.00" delta="4.00" laneChangeModel="LC2013" lcStrategic="0.5091719209419492" lcCooperative="0.8854467728463593" lcAssertive="4.815590691539943" lcSpeedGain="1.1639111046014528" lcKeepRight="0.0" lcOvertakeRight="0.877" />
+
+  <vType id="cav" carFollowModel="IDM" speedFactor="1" maxSpeed="35.46631186967486" minGap="2.94390525189298" accel="2.3655452248462066" decel="3.207636533267079" tau="1.6603715426741472" emergencyDecel="8.00" delta="4.00" laneChangeModel="LC2013" lcStrategic="0.5091719209419492" lcCooperative="0.8854467728463593" lcAssertive="4.815590691539943" lcSpeedGain="1.1639111046014528" lcKeepRight="0.0" lcOvertakeRight="0.877" />
+ 
     <route id="ramp" edges="ramp E2 E4" />
 	<route id="mainlane" edges="E0 E1 E2 E4 " />
 	
-    <flow id="mainlane_hdv" type="hdv" begin="0" end="300" vehsPerHour="5000" route="mainlane" departLane="random" departSpeed="desired"/>
-    <flow id="ramp_0_hdv" type="hdv" begin="0" end="300" vehsPerHour="1000" route="ramp" departLane="random" departSpeed="desired"/>
-</routes>
+    <flow id="mainlane_hdv" type="hdv" begin="0" end="300" vehsPerHour="3500.0" route="mainlane" departLane="random" departSpeed="desired" /><flow id="mainlane_cav" type="cav" begin="0" end="300" vehsPerHour="1500.0" route="mainlane" departLane="random" departSpeed="desired" /><flow id="ramp_0_hdv" type="hdv" begin="1" end="300" vehsPerHour="700.0" route="ramp" departLane="random" departSpeed="desired" /><flow id="ramp_0_cav" type="cav" begin="1" end="300" vehsPerHour="300.0" route="ramp" departLane="random" departSpeed="desired" /></routes>

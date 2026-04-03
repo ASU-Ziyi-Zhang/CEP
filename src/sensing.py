@@ -239,61 +239,216 @@ class VehicleState:
     def __repr__(self):
         return f"VehicleState(lat={self.latitude}, lon={self.longitude}, speed={self.speed}, accel={self.acceleration}, heading={self.heading}, rate={self.heading_rate_change}, traj={self.intended_trajectory})"
 
-def get_front_tl(s, l, tls):
-    '''Get distance, status, and index of nearest traffic light in front of position s+l'''
-    ds = 2000.
-    ls = LightStatus.GREEN.value
-    i = -1
+def get_upcoming_traffic_light_states(self, ego_id):
+    """
+    Retrieve upcoming traffic light states based on signal phase plans, filtering traffic lights outside CONN_RANGE.
 
-    for k in range(0, len(tls)):
-        d0 = tls[k].s - (s + l)
-        if d0 > -5 and d0 < ds:
-            ds, ls, i = d0, tls[k].status, k
+    Parameters:
+    - ego_id (str): The ID of the ego vehicle for which upcoming traffic lights should be checked.
 
-    return ds, ls, i
+    Returns:
+    - dict: A dictionary containing traffic light IDs as keys and their current and next upcoming states as values.
+    """
 
-def get_n_front_tls(n, s, l, tls):
-    '''Get vector of n nearest traffic lights in front of position s+l'''
-    # Get all traffic light distances from ego vehicle front bumper
-    d0s = [tls[k].s - (s + l) for k in range(0, len(tls))]
-    is_fronts = [d0 > -5 for d0 in d0s]
+    # Get traffic light information for the ego vehicle
+    next_tls = traci.vehicle.getNextTLS(ego_id) # [(tlsID, tlsIndex, distance, state), ...]
 
-    # Sort the distances from smallest -> farthest
-    d0s, is_fronts, tls = zip(*sorted(zip(d0s, is_fronts, tls)))
+    # Iterate through detected upcoming traffic lights
+    traffic_light_states = {}  # Dictionary to store traffic light states
 
-    # Get sorted traffic light objects for all those in front
-    ntls = [tls[k] for k in range(0, len(tls)) if is_fronts[k]]
+    for tls in next_tls:
+        tl_id = tls[0]  # Traffic light ID
+        tl_ind = tls[1]
+        distance = tls[2]  # Distance to the traffic light
+        current_state = tls[3]  # Current signal state
 
-    # Only provide first n tls in front of ego
-    if len(ntls) > n:
-        ntls = ntls[0:n]
-    
-    return ntls
+        # Filter out traffic lights beyond CONN_RANGE
+        if distance > CONN_RANGE:
+            continue  # Skip this traffic light if it's too far
 
-def get_n_latest_tls(n, s, l, tls):
-    '''Get vector of n latest traffic lights, preferring those in front of position s+l'''
-    # Get all traffic light distances from ego vehicle front bumper
-    d0s = [tls[k].s - (s + l) for k in range(0, len(tls))]
-    is_fronts = [d0 > -5 for d0 in d0s]
+        # Get parameters
+        cycle_time = traci.trafficlight.getParameter(tl_id, "cycleTime")
+        offset = traci.trafficlight.getParameter(tl_id, "offset")
 
-    # Sort the distances from smallest -> farthest
-    d0s, is_fronts, tls = zip(*sorted(zip(d0s, is_fronts, tls)))
+        # Retrieve all program logics for the traffic light
+        logics = traci.trafficlight.getAllProgramLogics(tl_id)
+        current_phase_i = traci.trafficlight.getPhase(tl_id)
 
-    # Get sorted traffic light objects for all those in front
-    rtls = [tls[k] for k in range(0, len(tls)) if not is_fronts[k]]
-    ftls = [tls[k] for k in range(0, len(tls)) if is_fronts[k]]
+        # Assuming we use the first logic entry (default program)
+        if logics:
+            logic = logics[0]  # Select the main signal program
 
-    # Only provide first n tls in front of ego
-    len_ftls = len(ftls)
-    if len_ftls > n:
-        ftls = ftls[0:n]
+            # Parameters
+            ring1 = logic.getParameter('ring1')
+            ring2 = logic.getParameter('ring2')
+                
+            # Compute the next n states
+            n_phases = len(logic.phases)
 
-    # Prepend with latest m tls behind of ego if not enough lights are in front
-    ntls = ftls
-    if len_ftls < n:
-        m = n-len_ftls
-        ntls = rtls[-m::] + ftls
+            next_states = {}
+            for i in range(n_phases):  # Retrieve the next n phases
+                phase_index = (current_phase_i + i) % n_phases
+                
+                # Check name for turning phase or not
+                name = logic.phases[phase_index].name
+                is_turning = False
+                if name == '2' or name == '4' or name == '6' or name == '8':
+                    is_turning = True
 
-    assert len(ntls) == n, 'Incorrect number of traffic lights found!'
+                # Store filter
+                next_states[i] = {
+                    "phase_state": logic.phases[phase_index].state,
+                    "cycle_duration": logic.phases[phase_index].duration,
+                    "min_duration": logic.phases[phase_index].minDur,
+                    "max_duration": logic.phases[phase_index].maxDur,
+                    "phase_name": logic.phases[phase_index].name,
 
-    return ntls
+                    ## Cannot retrieve these values for some reason
+                    "yellow_guess": 3,
+                    "red_guess": 2 if is_turning else 0
+                }
+
+            # Store traffic light state information
+            traffic_light_states[tl_id] = {
+                "sim_time": self.sim_time,
+                "cycle_time": cycle_time,
+                "offset": offset,
+
+                "distance_to_current_tl": distance,
+                "current_state": current_state,
+                "next_states": next_states, # Store next n states
+                
+                # Parameters
+                "ring1": ring1,
+                "ring2": ring2,
+                "link_index": -1,
+            }
+
+        else: # if logics
+            warnings.warn(f"No Traffic light logic set for id {tl_id}?")
+
+    return traffic_light_states  # Return structured traffic light information
+
+def get_routewise_upcoming_traffic_light_states(self, ego_id):
+    """
+    Retrieve route-wise upcoming traffic light states only for lanes in the ego vehicle's planned route.
+
+    Parameters:
+    - ego_id (str): The ID of the ego vehicle.
+
+    Returns:
+    - dict: A dictionary mapping traffic light IDs to route-wise signal states only for relevant lanes.
+    """
+
+    traffic_light_states = {}
+
+    if not self.is_traffic_light_scenario(): # TODO Hardcode since this scenario should have traffic lights
+        return traffic_light_states
+
+    # Get upcoming traffic lights
+    next_tls = traci.vehicle.getNextTLS(ego_id) # [(tlsID, tlsIndex, distance, state), ...]
+
+    if not next_tls:
+        return traffic_light_states
+
+    # Get planned route edges for the ego vehicle
+    ego_planned_route = traci.vehicle.getRoute(ego_id)
+
+    # Iterate through upcoming traffic lights
+    for tls in next_tls:
+        tl_id = tls[0]  # Traffic light ID
+        tl_ind = tls[1]
+        distance = tls[2]  # Distance to the traffic light
+        current_state = tls[3]  # Current signal state
+
+        # Filter out traffic lights beyond CONN_RANGE
+        if distance > CONN_RANGE:
+            continue  # Skip if too far
+
+        # Get parameters
+        # cycle_time = traci.trafficlight.getParameter(tl_id, "cycleTime")
+        # offset = traci.trafficlight.getParameter(tl_id, "offset")
+
+        # Retrieve all program logics for the traffic light
+        logics = traci.trafficlight.getAllProgramLogics(tl_id)
+        current_phase_i = traci.trafficlight.getPhase(tl_id)
+
+        if logics:
+            logic = logics[0]  # Select main signal program
+
+            # Filter only relevant lanes based on the ego vehicle's route
+            tl_controlled_links = []
+
+            tl_controlled_lanes = traci.trafficlight.getControlledLanes(tl_id)
+            for lane in tl_controlled_lanes:
+                split = lane.split('_')
+                tl_controlled_links.append(split[0])
+
+                # Error check
+                if len(split) > 2:
+                    raise ValueError(f'TL Lane ID found as {lane}. Was expecting a format with 1 underscore <>_<>?')
+            
+            active_links = [link for link in tl_controlled_links if link in ego_planned_route]
+
+            if not active_links:
+                raise ValueError("No active lanes?")
+            
+            link_index = tl_controlled_links.index(active_links[0])
+
+            # Parameters
+            ring1 = logic.getParameter('ring1')
+            ring2 = logic.getParameter('ring2')
+
+            # Store lane-wise phase transitions only for relevant lanes
+            n_phases = len(logic.phases)
+
+            next_states = {}
+            for i in range(n_phases):  # Retrieve next n phases
+                phase_index = (current_phase_i + i) % n_phases
+                
+                # Check name for turning phase or not
+                name = logic.phases[phase_index].name
+                is_turning = False
+                if name == '2' or name == '4' or name == '6' or name == '8':
+                    is_turning = True
+
+                # Store only filtered lanes
+                next_states[i] = {
+                    "phase_state": logic.phases[phase_index].state,
+                    "cycle_duration": logic.phases[phase_index].duration,
+                    "min_duration": logic.phases[phase_index].minDur,
+                    "max_duration": logic.phases[phase_index].maxDur,
+                    "phase_name": logic.phases[phase_index].name,
+                    
+                    ## Cannot retrieve these values for some reason
+                    "yellow_guess": 3,
+                    "red_guess": 2 if is_turning else 0,
+                }
+
+                # Error Checking
+                if not len(logic.phases[phase_index].state) == len(tl_controlled_links):
+                    raise ValueError('len?')
+                elif not link_index and link_index!=0:
+                    raise ValueError('No link index?')
+
+            # Store traffic light state information
+            traffic_light_states[tl_id] = {
+                "sim_time": self.sim_time,
+
+                # "cycle_time": cycle_time,
+                # "offset": offset,
+
+                "distance_to_current_tl": distance,
+                "current_state": current_state,
+                "next_states": next_states,  # Lane-wise phase transitions (filtered)
+
+                # Parameters
+                "ring1": ring1,
+                "ring2": ring2,
+                "link_index": link_index,
+            }
+
+        else: # if logics
+            warnings.warn(f"No Traffic light logic set for id {tl_id}?")
+
+    return traffic_light_states  # Return filtered traffic light states

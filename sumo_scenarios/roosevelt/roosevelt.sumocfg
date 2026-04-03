@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- generated on 2024-06-27 09:37:51 by Eclipse SUMO sumo Version 1.19.0
+-->
+
+<configuration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/sumoConfiguration.xsd">
+
+    <input>
+        <net-file value="roosevelt.net.xml"/>
+        <route-files value="roosevelt.rou.xml"/>
+        <additional-files value="sensors.add.xml,signal.add.xml"/>
+    </input>
+
+    <output>
+        <edgedata-output value="by_edge.xml"/>
+        <lanedata-output value="by_lane.xml"/>
+        <statistic-output value="stats.xml"/>
+        <summary-output value="summary.xml"/>
+        <tripinfo-output value="tripinfo.xml"/>
+    </output>	
+	
+    <time>
+        <begin value="0"/>
+        <step-length value="0.1"/>
+		<time-to-teleport value="-1"/>
+    </time>
+
+</configuration>

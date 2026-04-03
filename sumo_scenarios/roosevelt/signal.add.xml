@@ -1,0 +1,87 @@
+<additional>
+
+    <rerouter id="Clinton" edges="435381830#0">
+        <interval begin="0" end="18000">   <!-- 2.28 -->
+            <change programID="0" tl="Clinton"/>
+        </interval>
+        <interval begin="18000" end="32400"> <!-- 3.1 -->
+            <change programID="1" tl="Clinton"/>
+        </interval>
+        <interval begin="32400" end="86400"> <!-- 3.1 -->
+            <change programID="2" tl="Clinton"/>
+        </interval>
+    </rerouter>
+
+    <rerouter id="Canal" edges="435381826#0">
+        <interval begin="0" end="18000">   <!-- 2.28 -->
+            <change programID="0" tl="Canal"/>
+        </interval>
+        <interval begin="18000" end="32400"> <!-- 3.1 -->
+            <change programID="1" tl="Canal"/>
+        </interval>
+        <interval begin="32400" end="86400"> <!-- 3.1 -->
+            <change programID="1" tl="Canal"/>
+        </interval>
+    </rerouter>
+
+    <rerouter id="Delano" edges="435542925#0">
+        <interval begin="0" end="18000">   <!-- 2.28 -->
+            <change programID="0" tl="Delano"/>
+        </interval>
+        <interval begin="18000" end="32400"> <!-- 3.1 -->
+            <change programID="1" tl="Delano"/>
+        </interval>
+        <interval begin="32400" end="86400"> <!-- 3.1 -->
+            <change programID="2" tl="Delano"/>
+        </interval>
+    </rerouter>
+
+    <rerouter id="Clark" edges="435542921#0">
+        <interval begin="0" end="18000">   <!-- 2.28 -->
+            <change programID="0" tl="Clark"/>
+        </interval>
+        <interval begin="18000" end="32400"> <!-- 3.1 -->
+            <change programID="1" tl="Clark"/>
+        </interval>
+        <interval begin="32400" end="86400"> <!-- 3.1 -->
+            <change programID="2" tl="Clark"/>
+        </interval>
+    </rerouter>
+
+    <rerouter id="State" edges="435542920">
+        <interval begin="0" end="18000">   <!-- 2.28 -->
+            <change programID="0" tl="State"/>
+        </interval>
+        <interval begin="18000" end="32400"> <!-- 3.1 -->
+            <change programID="1" tl="State"/>
+        </interval>
+        <interval begin="32400" end="86400"> <!-- 3.1 -->
+            <change programID="2" tl="State"/>
+        </interval>
+    </rerouter>
+
+    <rerouter id="Wabash" edges="435542903#0">
+        <interval begin="0" end="18000">   <!-- 2.28 -->
+            <change programID="0" tl="Wabash"/>
+        </interval>
+        <interval begin="18000" end="32400"> <!-- 3.1 -->
+            <change programID="1" tl="Wabash"/>
+        </interval>
+        <interval begin="32400" end="86400"> <!-- 3.1 -->
+            <change programID="2" tl="Wabash"/>
+        </interval>
+    </rerouter>
+
+    <rerouter id="Michigan" edges="990453574#1">
+        <interval begin="0" end="18000">   <!-- 2.28 -->
+            <change programID="0" tl="Michigan"/>
+        </interval>
+        <interval begin="18000" end="32400"> <!-- 3.1 -->
+            <change programID="1" tl="Michigan"/>
+        </interval>
+        <interval begin="32400" end="86400"> <!-- 3.1 -->
+            <change programID="2" tl="Michigan"/>
+        </interval>
+    </rerouter>
+
+</additional>

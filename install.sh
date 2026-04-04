@@ -3,6 +3,32 @@
 ## https://sumo.dlr.de/docs/Downloads.php
 ## https://docs.python.org/3/library/venv.html
 
+# ------------------
+## ANSI ESCAPE CODES
+# ------------------
+NOCOLOR='\033[m'
+BLACK='\033[0;30m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+
+info() {
+    echo -e "${BLUE}[INFO] $1${NOCOLOR}"
+}
+
+success() {
+    echo -e "${GREEN}[OK] $1${NOCOLOR}"
+}
+
+warn() {
+    echo -e "${YELLOW}[WARN] $1${NOCOLOR}"
+}
+
+error() {
+    echo -e "${RED}[ERROR] $1${NOCOLOR}"
+}
+
 ## Check that python and pip are installed 
 COMMAND=python # Default command to try
 if [ -x "$(command -v python)" ]; then
@@ -15,18 +41,18 @@ elif [ -x "$(command -v py)" ]; then
     COMMAND=py
 
 else
-    echo "Could not find Python installed in path. Exiting."
-    exit 1
+    error "Could not find Python installed in path. Exiting."
+    return 1 || exit 1
 
 fi
 
 # PIP
 if [ -x "$(command -v pip)" ]; then
-    echo "pip found"
+    info "Found pip installed in path. Using pip to install sumo and dependencies."
 
 else
-    echo "Could not find pip installed in path. Exiting."
-    exit 1
+    error "Could not find pip installed in path. Exiting."
+    return 1 || exit 1
     
 fi
 
@@ -41,46 +67,47 @@ if [ $USING_VENV -eq 1 ]; then
     
     # Run the activate script
     if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-        echo "Linux GNU detected."
+        info "Linux GNU detected."
         . bin/activate
 
     elif [[ "$OSTYPE" == "darwin"* ]]; then
-        echo "Mac OSX detected."
+        info "Mac OSX detected."
         . bin/activate
 
     elif [[ "$OSTYPE" == "cygwin" ]]; then
-        echo "POSIX/Linux for Windows detected."
+        info "POSIX/Linux for Windows detected."
         Scripts\Activate.ps1
 
     else
-        echo "Could not determine OS type. "
-        echo "Manually activate the virutal environment through script bin/activate."
-        echo "Manually install sumo to virtual environemtn through pip:"
-        echo "    pip install eclipse-sumo"
-        echo "    pip install traci"
-        echo "    pip install libsumo"
+
+        error "Could not determine OS type. "
+        error "Manually activate the virtual environment through script bin/activate."
+        error "Manually install sumo to virtual environment through pip:"
+        error "    pip install eclipse-sumo"
+        error "    pip install traci"
+        error "    pip install libsumo"
         
-        exit 1
+        return 1 || exit 1
     fi
     
-    pip install eclipse-sumo
-    pip install traci
-    pip install libsumo
+    pip install -q eclipse-sumo
+    pip install -q traci
+    pip install -q libsumo
 
-    pip install matplotlib
-    pip install numpy
-    pip install pandas
-    pip install scipy
+    pip install -q matplotlib
+    pip install -q numpy
+    pip install -q pandas
+    pip install -q scipy
     
 else
-    pip install eclipse-sumo
-    pip install traci
-    pip install libsumo
+    pip install -q eclipse-sumo
+    pip install -q traci
+    pip install -q libsumo
 
-    pip install matplotlib
-    pip install numpy
-    pip install pandas
-    pip install scipy
+    pip install -q matplotlib
+    pip install -q numpy
+    pip install -q pandas
+    pip install -q scipy
 
 fi
 
@@ -88,3 +115,6 @@ fi
 cd codegen
 . install.sh
 cd ..
+
+## Done
+success "Installation complete."

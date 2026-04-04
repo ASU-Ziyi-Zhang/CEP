@@ -3,7 +3,7 @@
 
     <input>
         <net-file value="onramp.net.xml"/>
-        <route-files value="onramp_p0.1.rou.xml"/>
+        <route-files value="onramp.rou.xml"/>
     </input>
     <output>
         <edgedata-output value="./output/by_edge.xml"/>

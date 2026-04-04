@@ -6,6 +6,7 @@
 
 import csv
 import json
+import pandas as pd
 
 class logger:
     def __init__(self, filename = "output"):
@@ -67,3 +68,31 @@ class logger:
             json.dump(write_data, file, indent=4)  # Pretty formatting for readability
 
         self.iter += 1
+
+class pretty_printer:
+    NOCOLOR='\033[m'
+    BLACK='\033[0;30m'
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    BLUE='\033[0;34m'
+
+    @staticmethod
+    def print(msg, color=NOCOLOR):
+        print(f"{color}{msg}{pretty_printer.NOCOLOR}")
+
+    @staticmethod
+    def success(msg):
+        print(f"{pretty_printer.GREEN}[OK]{msg}{pretty_printer.NOCOLOR}")
+
+    @staticmethod
+    def info(msg):
+        print(f"{pretty_printer.BLUE}[INFO]{msg}{pretty_printer.NOCOLOR}")
+
+    @staticmethod
+    def warn(msg):
+        print(f"{pretty_printer.YELLOW}[WARN]{msg}{pretty_printer.NOCOLOR}")
+
+    @staticmethod
+    def error(msg):
+        print(f"{pretty_printer.RED}[ERROR]{msg}{pretty_printer.NOCOLOR}")

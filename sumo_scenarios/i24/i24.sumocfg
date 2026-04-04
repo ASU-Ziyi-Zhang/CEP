@@ -3,7 +3,7 @@
 
     <input>
         <net-file value="i24.net.xml"/>
-        <route-files value="i24_p0.1.rou.xml"/>
+        <route-files value="i24.rou.xml"/>
         <additional-files value="I24_RDS.add.xml"/>
     </input>
 

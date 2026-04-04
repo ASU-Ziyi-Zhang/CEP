@@ -1,0 +1,138 @@
+///////////////////////////////////////
+/// Tyler Ard                       ///
+/// Vehicle Mobility Systems Group  ///
+/// tard(at)anl(dot)gov             ///
+///////////////////////////////////////
+
+#define S_FUNCTION_NAME  deserialize_bsm
+#define S_FUNCTION_LEVEL 2
+
+#include "simstruc.h"
+#include <stdint.h>
+#include <string.h>
+
+#include "serial_utils.h"
+
+static void mdlInitializeSizes(SimStruct *S) {
+    // Define function parameters
+    ssSetNumSFcnParams(S, 0);
+
+    // Define one input port for serialized byte array
+    if (!ssSetNumInputPorts(S, 1)) return;
+    ssSetInputPortWidth(S, 0, BSM_MSG_SIZE);
+
+    // Define separate output ports for each field in the BSM structure
+    if (!ssSetNumOutputPorts(S, SIGNALS_N)) return;
+    
+    ssSetOutputPortWidth(S, 0, MSG_N);   // msg_type
+    ssSetOutputPortWidth(S, 1, ID_N);    // id
+    ssSetOutputPortWidth(S, 2, 1);       // current_utc_time
+    ssSetOutputPortWidth(S, 3, 1);       // latitude
+    ssSetOutputPortWidth(S, 4, 1);       // longitude
+    ssSetOutputPortWidth(S, 5, 1);       // rel_long_gap
+    ssSetOutputPortWidth(S, 6, 1);       // rel_lat_gap
+    ssSetOutputPortWidth(S, 7, 1);       // speed
+    ssSetOutputPortWidth(S, 8, 1);       // acceleration
+    ssSetOutputPortWidth(S, 9, 1);       // heading
+    ssSetOutputPortWidth(S, 10, 1);      // heading_rate_change
+    ssSetOutputPortWidth(S, 11, 1);      // error_flag (int16)
+    ssSetOutputPortWidth(S, 12, 1);      // elevation
+    ssSetOutputPortWidth(S, 13, 1);      // position_accuracy
+    ssSetOutputPortWidth(S, 14, 1);      // steering_angle
+    ssSetOutputPortWidth(S, 15, 1);      // transmission_state (int16)
+    ssSetOutputPortWidth(S, 16, 1);      // braking_status (int16)
+    ssSetOutputPortWidth(S, 17, 1);      // turn_signal_status (int16)
+    ssSetOutputPortWidth(S, 18, 1);      // length
+    ssSetOutputPortWidth(S, 19, 1);      // width
+    ssSetOutputPortWidth(S, 20, 1);      // path_history_n (uint16)
+    ssSetOutputPortWidth(S, 21, TRAJ_N); // path_history_time
+    ssSetOutputPortWidth(S, 22, TRAJ_N); // path_history_rel_long_pos
+    ssSetOutputPortWidth(S, 23, TRAJ_N); // path_history_rel_lat_pos
+    ssSetOutputPortWidth(S, 24, 1);      // path_intentions_n (uint16)
+    ssSetOutputPortWidth(S, 25, TRAJ_N); // path_intentions_time
+    ssSetOutputPortWidth(S, 26, TRAJ_N); // path_intentions_rel_long_pos
+    ssSetOutputPortWidth(S, 27, TRAJ_N); // path_intentions_rel_lat_pos
+
+    // Define direct feed through
+    for (int i = 0; i < SIGNALS_N; i++) {
+        if (!ssGetOutputPortConnected(S, i)) {
+        
+    }
+
+    // Define sample times
+    ssSetNumSampleTimes(S, 1);
+}
+
+static void mdlInitializeSampleTimes(SimStruct *S) {
+    ssSetSampleTime(S, 0, INHERITED_SAMPLE_TIME);
+    ssSetOffsetTime(S, 0, 0.0);
+}
+
+static void mdlOutputs(SimStruct *S, int_T tid) {
+    // **Check Input Port Connectivity**
+    if (!ssGetInputPortConnected(S, 0)) {
+        ssSetErrorStatus(S, "Input port is not connected. Data will not be transmitted.");
+        return;
+    }
+    
+
+    // **Check Output Port Connectivity**
+    for (int i = 0; i < SIGNALS_N; i++) {
+        if (!ssGetOutputPortConnected(S, i)) {
+            ssSetErrorStatus(S, "Missing output port connection. Serialization aborted.");
+            return;
+        }
+    }
+
+    // Read serialized input from Simulink
+    const uint8_T *udpData = (const uint8_T *) ssGetInputPortSignal(S, 0);
+
+    // Deserialize data into the BSM struct
+    BSM parsedData;
+    memcpy(&parsedData, udpData, sizeof(BSM));
+
+    // Assign outputs
+    char *out_msg_type = (char *) ssGetOutputPortSignal(S, 0);
+    char *out_id = (char *) ssGetOutputPortSignal(S, 1);
+    real_T *out_current_utc_time = ssGetOutputPortSignal(S, 2);
+    real_T *out_latitude = ssGetOutputPortSignal(S, 3);
+    real_T *out_longitude = ssGetOutputPortSignal(S, 4);
+    real_T *out_rel_long_gap = ssGetOutputPortSignal(S, 5);
+    real_T *out_rel_lat_gap = ssGetOutputPortSignal(S, 6);
+    real_T *out_speed = ssGetOutputPortSignal(S, 7);
+    real_T *out_acceleration = ssGetOutputPortSignal(S, 8);
+    real_T *out_heading = ssGetOutputPortSignal(S, 9);
+    real_T *out_heading_rate_change = ssGetOutputPortSignal(S, 10);
+    int16_T *out_error_flag = (int16_T *) ssGetOutputPortSignal(S, 11);
+    real_T *out_elevation = ssGetOutputPortSignal(S, 12);
+    real_T *out_position_accuracy = ssGetOutputPortSignal(S, 13);
+    real_T *out_steering_angle = ssGetOutputPortSignal(S, 14);
+    int16_T *out_transmission_state = (int16_T *) ssGetOutputPortSignal(S, 15);
+    int16_T *out_braking_status = (int16_T *) ssGetOutputPortSignal(S, 16);
+    int16_T *out_turn_signal_status = (int16_T *) ssGetOutputPortSignal(S, 17);
+    real_T *out_length = ssGetOutputPortSignal(S, 18);
+    real_T *out_width = ssGetOutputPortSignal(S, 19);
+    uint16_T *out_path_history_n = (uint16_T *) ssGetOutputPortSignal(S, 20);
+    real_T *out_path_history_time = ssGetOutputPortSignal(S, 21);
+    real_T *out_path_history_rel_long_pos = ssGetOutputPortSignal(S, 22);
+    real_T *out_path_history_rel_lat_pos = ssGetOutputPortSignal(S, 23);
+    uint16_T *out_path_intentions_n = (uint16_T *) ssGetOutputPortSignal(S, 24);
+    real_T *out_path_intentions_time = ssGetOutputPortSignal(S, 25);
+    real_T *out_path_intentions_rel_long_pos = ssGetOutputPortSignal(S, 26);
+    real_T *out_path_intentions_rel_lat_pos = ssGetOutputPortSignal(S, 27);
+
+    // Assign struct values to outputs
+    strncpy(out_msg_type, parsedData.msg_type, MSG_N);
+    strncpy(out_id, parsedData.id, ID_N);
+    *out_current_utc_time = parsedData.current_utc_time;
+    memcpy(out_path_history_time, parsedData.path_history_time, TRAJ_N * sizeof(double));
+    memcpy(out_path_intentions_time, parsedData.path_intentions_time, TRAJ_N * sizeof(double));
+}
+
+static void mdlTerminate(SimStruct *S) {}
+
+#ifdef MATLAB_MEX_FILE
+#include "simulink.c"
+#else
+#include "cg_sfun.h"
+#endif

@@ -1,111 +1,127 @@
 import gzip
 import csv
 import re
+import random
 import pandas as pd
 import numpy as np
 import os
 import xml.etree.ElementTree as ET
 from scipy.interpolate import interp1d
 from collections import OrderedDict
+from math import floor
 
-def update_flows(penetration_rate, input_file="onramp_template.rou.xml", output_file="onramp.rou.xml",
-                 hdv_type="hdv", cav_type="cav"):
+def update_flows(penetration_rate, input_file="onramp_template.rou.xml", output_file="onramp.rou.xml", seed=23423):
     """
-    Split each <flow> in a SUMO routes file into HDV/CAV subflows according to
-    the given penetration rate, preserving original timing/routes and attributes.
+    Convert each demand flow into a deterministic vehicle manifest and then
+    assign HDV/CAV types on top of that fixed manifest.
 
     Behavior
     --------
-    - For each <flow ... vehsPerHour=V ...>, write two flows:
-        * id="{orig}_hdv", type=hdv_type, vehsPerHour=V*(1-pen)
-        * id="{orig}_cav", type=cav_type, vehsPerHour=V*pen
-      All other attributes (begin, end, route, departLane, departSpeed, etc.)
-      are preserved from the original flow.
-    - If V is not provided (unlikely), the original flow is copied unchanged.
-    - If pen is 0 or 1, only one subflow is written accordingly.
-
-    Parameters
-    ----------
-    penetration_rate : float
-        CAV penetration rate in [0, 1].
-    input_file : str
-        Path to the template .rou.xml file.
-    output_file : str
-        Path where the modified routes file is written.
-    hdv_type : str
-        SUMO vType ID to assign to HDV flows (default: "hdv").
-    cav_type : str
-        SUMO vType ID to assign to CAV flows (default: "cav").
+    - Build one penetration-independent list of explicit <vehicle> departures
+      from the original unsplit flows.
+    - Use the same manifest for every penetration value.
+    - Assign exactly round(N * penetration_rate) vehicles to type="cav" using a
+      deterministic ranking derived from the provided seed.
+    - Preserve route/departLane/departSpeed and other non-flow-specific attrs.
 
     Notes
     -----
-    The previous implementation only matched specific flow ids via regex and
-    hard-coded begin/end. This general version parses XML and works for i24 and
-    onramp templates alike.
+    Splitting one SUMO flow into separate HDV/CAV subflows changes how many
+    vehicles SUMO generates and inserts, especially for low-rate flows. That
+    makes penetration sweeps incomparable because demand itself changes with the
+    penetration tag. This implementation fixes the demand sample first and only
+    changes the vehicle type labels across penetrations.
     """
+    def _clone_element(elem):
+        return ET.fromstring(ET.tostring(elem, encoding="utf-8"))
+
+    def _vehicle_count_from_flow(total_vph, begin, end, rng):
+        duration = max(end - begin, 0.0)
+        expected = total_vph * duration / 3600.0
+        count = int(floor(expected))
+        if rng.random() < (expected - count):
+            count += 1
+        return max(count, 0)
+
     tree = ET.parse(input_file)
     root = tree.getroot()
 
-    # Collect original flows to avoid modifying while iterating
-    original_flows = list(root.findall('flow'))
+    manifest_rng = random.Random(int(seed))
+    type_rng = random.Random(int(seed) ^ 0x9E3779B9)
 
-    for flow in original_flows:
-        # Extract attributes with fallbacks
-        attrs = flow.attrib.copy()
+    pen = float(penetration_rate)
+    pen = max(0.0, min(1.0, pen))
+
+    output_root = ET.Element(root.tag, root.attrib)
+    manifest = []
+
+    for child in list(root):
+        if child.tag != 'flow':
+            output_root.append(_clone_element(child))
+            continue
+
+        attrs = child.attrib.copy()
         orig_id = attrs.get('id', 'flow')
         route = attrs.get('route')
         vph_str = attrs.get('vehsPerHour')
+        begin_str = attrs.get('begin')
+        end_str = attrs.get('end')
 
-        # Remove the original flow; we'll replace with split flows
-        root.remove(flow)
-
-        # If no vehsPerHour or route, just write the original back and continue
-        if vph_str is None or route is None:
-            root.append(flow)
+        if vph_str is None or route is None or begin_str is None or end_str is None:
+            output_root.append(_clone_element(child))
             continue
 
         try:
             total_vph = float(vph_str)
+            begin = float(begin_str)
+            end = float(end_str)
         except Exception:
-            # Unparsable vehsPerHour: keep original
-            root.append(flow)
+            output_root.append(_clone_element(child))
             continue
 
-        pen = float(penetration_rate)
-        pen = max(0.0, min(1.0, pen))  # clamp
+        if total_vph <= 0 or end < begin:
+            continue
 
-        cav_vph = total_vph * pen
-        hdv_vph = total_vph - cav_vph
+        count = _vehicle_count_from_flow(total_vph, begin, end, manifest_rng)
+        if count <= 0:
+            continue
 
-        def _mk_flow(suffix, vtype, vph):
-            new = ET.Element('flow')
-            for k, v in attrs.items():
-                if k == 'id':
-                    new.set('id', f"{orig_id}_{suffix}")
-                elif k == 'type':
-                    new.set('type', vtype)
-                elif k == 'vehsPerHour':
-                    new.set('vehsPerHour', f"{vph}")
-                else:
-                    new.set(k, v)
-            # Ensure required keys even if missing in original
-            if 'type' not in new.attrib:
-                new.set('type', vtype)
-            if 'route' not in new.attrib and route is not None:
-                new.set('route', route)
-            if 'vehsPerHour' not in new.attrib:
-                new.set('vehsPerHour', f"{vph}")
-            return new
+        depart_period = 3600.0 / total_vph
+        vehicle_attrs = {
+            k: v for k, v in attrs.items()
+            if k not in {'id', 'type', 'vehsPerHour', 'begin', 'end', 'number', 'probability', 'period'}
+        }
 
-        # Write HDV part if any
-        if hdv_vph > 0:
-            root.append(_mk_flow('hdv', hdv_type, hdv_vph))
-        # Write CAV part if any
-        if cav_vph > 0:
-            root.append(_mk_flow('cav', cav_type, cav_vph))
+        for idx in range(count):
+            manifest.append({
+                "manifest_idx": len(manifest),
+                "base_id": orig_id,
+                "seq": idx,
+                "depart": begin + idx * depart_period,
+                "attrs": vehicle_attrs,
+                "type_score": type_rng.random(),
+            })
 
-    # Save result
-    tree.write(output_file, encoding='UTF-8', xml_declaration=True)
+    total_vehicles = len(manifest)
+    target_cav = int(round(total_vehicles * pen))
+    cav_indices = {
+        idx for idx, _ in sorted(
+            enumerate(manifest),
+            key=lambda item: (item[1]["type_score"], item[1]["base_id"], item[1]["seq"]),
+        )[:target_cav]
+    }
+
+    for item in sorted(manifest, key=lambda x: (x["depart"], x["base_id"], x["seq"])):
+        veh_type = 'cav' if item["manifest_idx"] in cav_indices else 'hdv'
+        vehicle = ET.Element('vehicle')
+        vehicle.set('id', f"{item['base_id']}_{veh_type}.{item['seq']}")
+        vehicle.set('type', veh_type)
+        vehicle.set('depart', f"{item['depart']:.6f}")
+        for k, v in item["attrs"].items():
+            vehicle.set(k, v)
+        output_root.append(vehicle)
+
+    ET.ElementTree(output_root).write(output_file, encoding='UTF-8', xml_declaration=True)
 
 
 def extract_mile_marker(link_name):

@@ -1,0 +1,62 @@
+<?xml version="1.0" ?>
+<additional>
+
+  <poi id="W040" x="107.17" y="1054.73" type="node" color="0,0,255" layer="1"/>
+  <poi id="W046" x="133.03" y="1081" type="node" color="0,0,255" layer="1"/>
+  <poi id="W047" x="231.69" y="1053.91" type="node" color="0,0,255" layer="1"/>
+  <poi id="W048" x="259.33" y="1082.09" type="node" color="0,0,255" layer="1"/>
+  <poi id="W04A" x="811.87" y="1085.84" type="node" color="0,0,255" layer="1"/>
+  <poi id="W05F" x="959.09" y="1060.01" type="node" color="0,0,255" layer="1"/>
+  <poi id="W060" x="983.27" y="1088.52" type="node" color="0,0,255" layer="1"/>
+  <poi id="W061" x="1210.26" y="1062.67" type="node" color="0,0,255" layer="1"/>
+  <poi id="W062" x="1237.47" y="1091.7" type="node" color="0,0,255" layer="1"/>
+  <poi id="W063" x="1483.4" y="1064.04" type="node" color="0,0,255" layer="1"/>
+  <poi id="W064" x="1515.36" y="1093.27" type="node" color="0,0,255" layer="1"/>
+  <poi id="W049" x="333.56" y="1080.27" type="node" color="0,0,255" layer="1"/>
+
+    <e1Detector id="W040_left" lane="435381830#0_2" pos="400" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W040_right" lane="435381830#0_0" pos="400" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W040_straight" lane="435381830#0_1" pos="400" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W047_left" lane="435381826#0_3" pos="20" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W047_right" lane="435381826#0_0" pos="20" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W047_straight1" lane="435381826#0_2" pos="20" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W047_straight2" lane="435381826#0_1" pos="20" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W05F_left" lane="435542921#0_3" pos="40" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W05F_right" lane="435542921#0_0" pos="40" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W05F_straight1" lane="435542921#0_2" pos="40" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W05F_straight2" lane="435542921#0_1" pos="40" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W061_left" lane="435542920_3" pos="20" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W061_right" lane="435542920_0" pos="20" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W061_straight1" lane="435542920_2" pos="20" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W061_straight2" lane="435542920_1" pos="20" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W063_left" lane="990453574#1_3" pos="40" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W063_right" lane="990453574#1_0" pos="40" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W063_straight1" lane="990453574#1_2" pos="40" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W063_straight2" lane="990453574#1_1" pos="40" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W064_left" lane="435561321#0_3" pos="950" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W064_right" lane="435561321#0_0" pos="950" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W064_straight1" lane="435561321#0_2" pos="950" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W064_straight2" lane="435561321#0_1" pos="950" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W062_left" lane="435542902#0_3" pos="20" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W062_right" lane="435542902#0_0" pos="20" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W062_straight1" lane="435542902#0_2" pos="20" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W062_straight2" lane="435542902#0_1" pos="20" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W060_left" lane="277219207#0_3" pos="20" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W060_right" lane="277219207#0_0" pos="20" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W060_straight1" lane="277219207#0_2" pos="20" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W060_straight2" lane="277219207#0_1" pos="20" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W04A_straight1" lane="435542922#0_2" pos="75" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W04A_right" lane="435542922#0_0" pos="75" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W04A_straight2" lane="435542922#0_1" pos="75" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W048_left" lane="435381827#0_3" pos="10" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W048_right" lane="435381827#0_0" pos="10" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W048_straight1" lane="435381827#0_2" pos="10" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W048_straight2" lane="435381827#0_1" pos="10" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W046_left" lane="435381825#0_3" pos="20" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W046_right" lane="435381825#0_0" pos="20" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W046_straight1" lane="435381825#0_2" pos="20" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W046_straight2" lane="435381825#0_1" pos="20" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W049_straight1" lane="1243008255_0" pos="400" freq="60" file="detector_output.xml"/>
+    <e1Detector id="W049_straight2" lane="1243008255_1" pos="400" freq="60" file="detector_output.xml"/>
+
+</additional>

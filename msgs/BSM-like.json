@@ -1,0 +1,33 @@
+{
+    "current_utc_time": "d",
+
+    "latitude": "d",
+    "longitude": "d",
+    "rel_long_gap": "d",
+    "rel_lat_gap": "d",
+    "speed": "d",
+    "acceleration": "d",
+    "heading": "d",
+    "heading_rate_change": "d",
+
+    "error_flag": "h",
+
+    "elevation": "d",
+    "position_accuracy": "d",
+    "steering_angle": "d",
+
+    "transmission_state": "h",
+    "braking_status": "h",
+    "turn_signal_status": "h",
+    "length": "d",
+    "width": "d",
+
+    "path_history_n": "H",
+    "path_history_time": "10d",
+    "path_history_rel_long_pos": "10d",
+    "path_history_rel_lat_pos": "10d",
+    "path_intentions_n": "H",
+    "path_intentions_time": "10d",
+    "path_intentions_rel_long_pos": "10d",
+    "path_intentions_rel_lat_pos": "10d"
+}

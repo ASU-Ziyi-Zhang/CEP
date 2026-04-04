@@ -136,7 +136,7 @@ class c_api(object):
         self.initialize()
         
         # Print success status
-        print(f'CWrapper constructed for {file}')
+        print(f'C Wrapper constructed for {file}')
 
     def step_controller(self, IntscInfo, SpdLimInfo, CtrlInfo, CtrlPar, StopInfo):
         '''Steps the controller'''
